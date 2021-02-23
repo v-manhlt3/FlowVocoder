@@ -2,6 +2,7 @@
   "train": {
     "use_cuda": true,
     "log_interval": 20,
+    "log_dump_image": 2000,
     "seed": 1234,
     "epochs": 10000,
     "learning_rate": 1e0,
@@ -9,7 +10,7 @@
     "eps": 1e-9,
     "warmup_steps": 4000,
     "scheduler": "noam",
-    "batch_size": 32,
+    "batch_size": 64,
     "ddi": true,
     "fp16_run": true
   },

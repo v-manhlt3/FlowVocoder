@@ -2,11 +2,14 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from soft_dtw import trace_reverse
 
 import modules
 import commons
 import attentions
 import monotonic_align
+import soft_dtw as dtw
+from Aligner import Encoder
 
 
 class DurationPredictor(nn.Module):
@@ -205,6 +208,9 @@ class FlowGenerator(nn.Module):
       gin_channels=0, 
       n_split=4,
       n_sqz=1,
+      encoder_dim=100,
+      spk_embedding=64,
+      z_dim=64,
       sigmoid_scale=False,
       window_size=None,
       block_length=None,
@@ -241,21 +247,28 @@ class FlowGenerator(nn.Module):
     self.hidden_channels_dec = hidden_channels_dec
     self.prenet = prenet
 
-    self.encoder = TextEncoder(
-        n_vocab, 
-        out_channels, 
-        hidden_channels_enc or hidden_channels, 
-        filter_channels, 
-        filter_channels_dp, 
-        n_heads, 
-        n_layers_enc, 
-        kernel_size, 
-        p_dropout, 
-        window_size=window_size,
-        block_length=block_length,
-        mean_only=mean_only,
-        prenet=prenet,
-        gin_channels=gin_channels)
+    # self.encoder = TextEncoder(
+    #     n_vocab, 
+    #     out_channels, 
+    #     hidden_channels_enc or hidden_channels, 
+    #     filter_channels, 
+    #     filter_channels_dp, 
+    #     n_heads, 
+    #     n_layers_enc, 
+    #     kernel_size, 
+    #     p_dropout, 
+    #     window_size=window_size,
+    #     block_length=block_length,
+    #     mean_only=mean_only,
+    #     prenet=prenet,
+    #     gin_channels=gin_channels)
+    self.encoder = Encoder(
+          n_vocab,
+          spk_embedding,
+          z_dim,
+          encoder_dim,
+          256, ##
+    )
 
     self.decoder = FlowSpecDecoder(
         out_channels, 
@@ -270,6 +283,9 @@ class FlowGenerator(nn.Module):
         sigmoid_scale=sigmoid_scale,
         gin_channels=gin_channels)
 
+    self.soft_dtw = dtw.SoftDTW()
+
+
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
       nn.init.uniform_(self.emb_g.weight, -0.1, 0.1)
@@ -280,25 +296,36 @@ class FlowGenerator(nn.Module):
     x_m, x_logs, logw, x_mask = self.encoder(x, x_lengths, g=g)
 
     if gen:
-      w = torch.exp(logw) * x_mask * length_scale
-      w_ceil = torch.ceil(w)
-      y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+      # w = torch.exp(logw) * x_mask * length_scale
+      # w = logw*x_mask*length_scale
+      w_ceil = torch.ceil(logw.squeeze(-1))
+      w_ceil_length = torch.sum(w_ceil, -1)
+      y_lengths = w_ceil_length
+      # y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
       y_max_length = None
     else:
       y_max_length = y.size(2)
     y, y_lengths, y_max_length = self.preprocess(y, y_lengths, y_max_length)
+    # print('y_lengths shape: ', y_lengths.shape)
     z_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y_max_length), 1).to(x_mask.dtype)
     attn_mask = torch.unsqueeze(x_mask, -1) * torch.unsqueeze(z_mask, 2)
 
     if gen:
-      attn = commons.generate_path(w_ceil.squeeze(1), attn_mask.squeeze(1)).unsqueeze(1)
-      z_m = torch.matmul(attn.squeeze(1).transpose(1, 2), x_m.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
-      z_logs = torch.matmul(attn.squeeze(1).transpose(1, 2), x_logs.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
-      logw_ = torch.log(1e-8 + torch.sum(attn, -1)) * x_mask
-
+      # attn = commons.generate_path(w_ceil.squeeze(1), attn_mask.squeeze(1)).unsqueeze(1)
+      # print("------------w_ceil shape: ", w_ceil.shape)
+      
+      max_length = torch.max(w_ceil_length).item()
+      generated_pathes = commons.generate_path_dtw(w_ceil, int(max_length))
+      # result, attn = self.
+      z_m = torch.matmul(x_m, generated_pathes) # [b, t', t], [b, t, d] -> [b, d, t']
+      z_logs = torch.matmul(x_logs, generated_pathes) # [b, t', t], [b, t, d] -> [b, d, t']
+      # logw_ = torch.log(1e-8 + torch.sum(attn, -1)) * x_mask
+      print("z_m shape: ", z_m.shape)
+      print("z_mask shape: ", z_mask.shape)
+      z_mask = z_mask[:,:,:z_m.size(-1)]
       z = (z_m + torch.exp(z_logs) * torch.randn_like(z_m) * noise_scale) * z_mask
       y, logdet = self.decoder(z, z_mask, g=g, reverse=True)
-      return (y, z_m, z_logs, logdet, z_mask), (x_m, x_logs, x_mask), (attn, logw, logw_)
+      return y
     else:
       z, logdet = self.decoder(y, z_mask, g=g, reverse=False)
       with torch.no_grad():
@@ -308,12 +335,29 @@ class FlowGenerator(nn.Module):
         logp3 = torch.matmul((x_m * x_s_sq_r).transpose(1,2), z) # [b, t, d] x [b, d, t'] = [b, t, t']
         logp4 = torch.sum(-0.5 * (x_m ** 2) * x_s_sq_r, [1]).unsqueeze(-1) # [b, t, 1]
         logp = logp1 + logp2 + logp3 + logp4 # [b, t, t']
+        logp_ = logp*(-1)
+        # attn = monotonic_align.maximum_path(logp, attn_mask.squeeze(1)).unsqueeze(1).detach()
+        mismatch_likelihood, cost_matrices = self.soft_dtw(logp_)
+        
+      logw_, matrices_mask = trace_reverse(cost_matrices.detach().cpu().numpy()) # (b, t), (b, t, t')
+      logw_ = torch.from_numpy(logw_).to(x.device)
+      logw_ = logw_.float()
+      matrices_mask = torch.from_numpy(matrices_mask).to(x.device)
+      matrices_mask = matrices_mask.float()
 
-        attn = monotonic_align.maximum_path(logp, attn_mask.squeeze(1)).unsqueeze(1).detach()
-      z_m = torch.matmul(attn.squeeze(1).transpose(1, 2), x_m.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
-      z_logs = torch.matmul(attn.squeeze(1).transpose(1, 2), x_logs.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
-      logw_ = torch.log(1e-8 + torch.sum(attn, -1)) * x_mask
-      return (z, z_m, z_logs, logdet, z_mask), (x_m, x_logs, x_mask), (attn, logw, logw_)
+      # z_m = torch.matmul(attn.squeeze(1).transpose(1, 2), x_m.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
+      # z_logs = torch.matmul(attn.squeeze(1).transpose(1, 2), x_logs.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
+      # print("-------matrices_mask shape: ", matrices_mask.shape)
+      # print("-------LogW: ", torch.transpose(logw[0], -1, -2))
+      # print("-------LogW_: ", torch.transpose(logw_[0], -1, -2))
+      z_m = torch.matmul(x_m, matrices_mask)# [b, t', t], [b, t, d] -> [b, d, t']
+      z_logs = torch.matmul(x_logs, matrices_mask) # [b, t', t], [b, t, d] -> [b, d, t']
+      # logw_ = torch.log(1e-8 + torch.sum(attn, -1)) * x_mask
+      """
+        logw: (batch, 1, t)
+        logw_: (batch, 1, t)
+      """
+      return (z, z_m, z_logs, logdet, z_mask), (logw, logw_, mismatch_likelihood)
 
   def preprocess(self, y, y_lengths, y_max_length):
     if y_max_length is not None:

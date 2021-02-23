@@ -13,10 +13,13 @@ from apex.parallel import DistributedDataParallel as DDP
 from apex import amp
 
 from data_utils import TextMelLoader, TextMelCollate
+
 import models
 import commons
 import utils
 from text.symbols import symbols
+from PIL import Image
+
                             
 
 global_step = 0
@@ -28,10 +31,11 @@ def main():
 
   n_gpus = torch.cuda.device_count()
   os.environ['MASTER_ADDR'] = 'localhost'
-  os.environ['MASTER_PORT'] = '80000'
+  os.environ['MASTER_PORT'] = '80089'
 
   hps = utils.get_hparams()
-  mp.spawn(train_and_eval, nprocs=n_gpus, args=(n_gpus, hps,))
+  train_and_eval(0,n_gpus, hps)
+  # mp.spawn(train_and_eval, nprocs=n_gpus, args=(n_gpus, hps,))
 
 
 def train_and_eval(rank, n_gpus, hps):
@@ -41,9 +45,10 @@ def train_and_eval(rank, n_gpus, hps):
     logger.info(hps)
     utils.check_git_hash(hps.model_dir)
     writer = SummaryWriter(log_dir=hps.model_dir)
+    # writer = SummaryWriter(log_dir='logs/glow-dtw2')
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+  # dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
   torch.manual_seed(hps.train.seed)
   torch.cuda.set_device(rank)
 
@@ -68,9 +73,10 @@ def train_and_eval(rank, n_gpus, hps):
       out_channels=hps.data.n_mel_channels, 
       **hps.model).cuda(rank)
   optimizer_g = commons.Adam(generator.parameters(), scheduler=hps.train.scheduler, dim_model=hps.model.hidden_channels, warmup_steps=hps.train.warmup_steps, lr=hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)
-  if hps.train.fp16_run:
-    generator, optimizer_g._optim = amp.initialize(generator, optimizer_g._optim, opt_level="O1")
-  generator = DDP(generator)
+  # if hps.train.fp16_run:
+  #   generator, optimizer_g._optim = amp.initialize(generator, optimizer_g._optim, opt_level="O1")
+  # generator = DDP(generator)
+  generator = generator
   epoch_str = 1
   global_step = 0
   try:
@@ -86,7 +92,7 @@ def train_and_eval(rank, n_gpus, hps):
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
       train(rank, epoch, hps, generator, optimizer_g, train_loader, logger, writer)
-      evaluate(rank, epoch, hps, generator, optimizer_g, val_loader, logger, writer_eval)
+      # evaluate(rank, epoch, hps, generator, optimizer_g, val_loader, logger, writer_eval)
       utils.save_checkpoint(generator, optimizer_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "G_{}.pth".format(epoch)))
     else:
       train(rank, epoch, hps, generator, optimizer_g, train_loader, None, None)
@@ -98,31 +104,48 @@ def train(rank, epoch, hps, generator, optimizer_g, train_loader, logger, writer
 
   generator.train()
   for batch_idx, (x, x_lengths, y, y_lengths) in enumerate(train_loader):
+    """
+      x: sequence of phoneme tokens
+      y: sequence of melspec
+    """
     x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
 
     # Train Generator
     optimizer_g.zero_grad()
     
-    (z, z_m, z_logs, logdet, z_mask), (x_m, x_logs, x_mask), (attn, logw, logw_) = generator(x, x_lengths, y, y_lengths, gen=False)
-    l_mle = commons.mle_loss(z, z_m, z_logs, logdet, z_mask)
-    l_length = commons.duration_loss(logw, logw_, x_lengths)
+    # (z, z_m, z_logs, logdet, z_mask), (x_m, x_logs, x_mask), (attn, logw, logw_) = generator(x, x_lengths, y, y_lengths, gen=False)
+    (z, z_m, z_logs, logdet, z_mask), (logw, logw_, mismatch_likelihood) = generator(x, x_lengths, y, y_lengths, gen=False)
 
-    loss_gs = [l_mle, l_length]
+    # print('--------------logw: ', logw.shape) # logw: (b, 1, t)
+    # print('--------------logw_ : ', logw_.shape)
+    # print("-------------- tokens shape: ", x.shape) # tokens: (b, t)
+    # print("-------------- tokens's length shape: ", x_lengths.shape) # tokens length: (b)
+    l_mle, l_matching = commons.mle_loss(z, z_m, z_logs, logdet, z_mask, mismatch_likelihood)
+    l_length = commons.duration_loss(logw, logw_, x_lengths)
+    print("*************************************************************************************************************************")
+    print("------ GLOBAL STEP: ", global_step)
+    print("------loss mle: ", l_mle)
+    print("------l_matching: ", l_matching)
+    print("------loss l_length: ", l_length)
+    # print("****************************************************************************************")
+    loss_gs = [l_mle, l_matching, l_length]
     loss_g = sum(loss_gs)
 
-    if hps.train.fp16_run:
-      with amp.scale_loss(loss_g, optimizer_g._optim) as scaled_loss:
-        scaled_loss.backward()
-      grad_norm = commons.clip_grad_value_(amp.master_params(optimizer_g._optim), 5)
-    else:
-      loss_g.backward()
-      grad_norm = commons.clip_grad_value_(generator.parameters(), 5)
+    # if hps.train.fp16_run:
+    #   with amp.scale_loss(loss_g, optimizer_g._optim) as scaled_loss:
+    #     scaled_loss.backward()
+    #   grad_norm = commons.clip_grad_value_(amp.master_params(optimizer_g._optim), 5)
+    # else:
+    loss_g.backward()
+    grad_norm = commons.clip_grad_value_(generator.parameters(), 5)
     optimizer_g.step()
     
     if rank==0:
       if batch_idx % hps.train.log_interval == 0:
-        (y_gen, *_), *_ = generator.module(x[:1], x_lengths[:1], gen=True)
+        print("*************************** ESIMATE GENERATE MEL ***********************************************")
+        # y_gen = generator.module(x[:1], x_lengths[:1], gen=True)
+        y_gen = generator(x[:1], x_lengths[:1], gen=True)
         logger.info('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
           epoch, batch_idx * len(x), len(train_loader.dataset),
           100. * batch_idx / len(train_loader),
@@ -131,14 +154,24 @@ def train(rank, epoch, hps, generator, optimizer_g, train_loader, logger, writer
         
         scalar_dict = {"loss/g/total": loss_g, "learning_rate": optimizer_g.get_lr(), "grad_norm": grad_norm}
         scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(loss_gs)})
+        y_org_img =utils.plot_spectrogram_to_numpy(y[0].data.cpu().numpy())
+        y_gen_img = utils.plot_spectrogram_to_numpy(y_gen[0].data.cpu().numpy())
+
+        if global_step % hps.train.log_dump_image ==0:
+          org_img = Image.fromarray(y_org_img)
+          gen_img = Image.fromarray(y_gen_img)
+
+          org_img.save('logs/spec/org_'+str(global_step)+'.jpeg')
+          gen_img.save("logs/spec/gen_"+str(global_step)+".jpeg")
         utils.summarize(
           writer=writer,
           global_step=global_step, 
-          images={"y_org": utils.plot_spectrogram_to_numpy(y[0].data.cpu().numpy()), 
-            "y_gen": utils.plot_spectrogram_to_numpy(y_gen[0].data.cpu().numpy()), 
-            "attn": utils.plot_alignment_to_numpy(attn[0,0].data.cpu().numpy()),
+          images={"y_org": y_org_img, 
+            "y_gen": y_gen_img, 
+            # "attn": utils.plot_alignment_to_numpy(attn[0,0].data.cpu().numpy()),
             },
           scalars=scalar_dict)
+
     global_step += 1
   
   if rank == 0:

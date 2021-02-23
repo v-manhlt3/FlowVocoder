@@ -16,16 +16,29 @@ def intersperse(lst, item):
   return result
 
 
-def mle_loss(z, m, logs, logdet, mask):
+def mle_loss(z, m, logs, logdet, mask, mismatch_likelihood):
+  """ Normalizng flow loss NLL
+  log p(x) = log p(z) - log| det(d_f/d_z) |
+  where m: mean of prior
+        logs: log of scale of prior
+        mask: maske of output data
+  """
+  
+  l_matching = torch.sum(mismatch_likelihood)/(z.size(0)*z.size(2))
+  # print('----------loss matching: ', l_matching)
   l = torch.sum(logs) + 0.5 * torch.sum(torch.exp(-2 * logs) * ((z - m)**2)) # neg normal likelihood w/o the constant term
   l = l - torch.sum(logdet) # log jacobian determinant
   l = l / torch.sum(torch.ones_like(z) * mask) # averaging across batch, channel and time axes
   l = l + 0.5 * math.log(2 * math.pi) # add the remaining constant term
-  return l
+  return l, l_matching
 
 
+# def duration_loss(logw, logw_, lengths):
+#   l = torch.sum((logw - logw_)**2) / torch.sum(lengths)
+#   return l
 def duration_loss(logw, logw_, lengths):
-  l = torch.sum((logw - logw_)**2) / torch.sum(lengths)
+  l = torch.sum((torch.sum(logw, -1) - torch.sum(logw_, -1))) / torch.sum(lengths)
+  l = torch.abs(l)
   return l
 
 
@@ -52,7 +65,8 @@ def shift_1d(x):
 
 def sequence_mask(length, max_length=None):
   if max_length is None:
-    max_length = length.max()
+    max_length = int(length.max().item())
+  # print('max_length: ', max_length)
   x = torch.arange(max_length, dtype=length.dtype, device=length.device)
   return x.unsqueeze(0) < length.unsqueeze(1)
 
@@ -113,6 +127,16 @@ def generate_path(duration, mask):
   path = path * mask
   return path
 
+def generate_path_dtw(duration, max_length):
+
+  pathes = torch.zeros(duration.size(0), duration.size(1), max_length-1).to(duration.device)
+  for k in range(pathes.size(0)):
+    off_set = 0
+    for i in range(pathes.size(1)):
+      dur = int(duration[k,i].item())
+      pathes[k, i, off_set:dur] = 1
+      off_set += dur
+  return pathes
 
 class Adam():
   def __init__(self, params, scheduler, dim_model, warmup_steps=4000, lr=1e0, betas=(0.9, 0.98), eps=1e-9):
@@ -218,6 +242,9 @@ def clip_grad_value_(parameters, clip_value, norm_type=2):
 
 
 def squeeze(x, x_mask=None, n_sqz=2):
+  # print('x_size: ', x.size())
+  # if x.size(3):
+  #   x = x.squeeze()
   b, c, t = x.size()
 
   t = (t // n_sqz) * n_sqz
@@ -227,8 +254,13 @@ def squeeze(x, x_mask=None, n_sqz=2):
   
   if x_mask is not None:
     x_mask = x_mask[:,:,n_sqz-1::n_sqz]
+    # x_mask = x_mask.long()
   else:
+    # x_mask = torch.ones(b, 1, t//n_sqz).to(device=x.device, dtype=x.dtype)
     x_mask = torch.ones(b, 1, t//n_sqz).to(device=x.device, dtype=x.dtype)
+  # x_mask = x_mask.to(x.dtype)
+  # print("-------------- x_sqz: ", x_sqz.dtype)
+  # print("-------------- x_mask: ", x_mask.dtype)
   return x_sqz * x_mask, x_mask
 
 
@@ -244,3 +276,54 @@ def unsqueeze(x, x_mask=None, n_sqz=2):
     x_mask = torch.ones(b, 1, t*n_sqz).to(device=x.device, dtype=x.dtype)
   return x_unsqz * x_mask, x_mask
 
+import torch.nn as nn
+from torch.nn.utils import spectral_norm
+
+class Conv1d(nn.Module):
+
+    "Conv1d for spectral normalisation and orthogonal initialisation"
+
+    def __init__(self,
+           in_channels,
+           out_channels,
+           kernel_size=1,
+           stride=1,
+           dilation=1,
+           groups=1):
+        super(Conv1d, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.dilation = dilation
+        self.groups = groups
+        pad = dilation * (kernel_size - 1) // 2
+
+        layer = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size,
+                stride=stride, padding=pad, dilation=dilation, groups=groups)
+        nn.init.orthogonal_(layer.weight)
+        self.layer = spectral_norm(layer)
+
+    def forward(self, inputs):
+        return self.layer(inputs)
+
+class Linear(nn.Module):
+
+    "Linear for spectral normalisation and orthogonal initialisation"
+
+    def __init__(self,
+           in_features,
+           out_features,
+           bias=True):
+        super(Linear, self).__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        layer = nn.Linear(in_features, out_features, bias)
+        nn.init.orthogonal_(layer.weight)
+        self.layer = spectral_norm(layer)
+
+    def forward(self, inputs):
+        return self.layer(inputs)
