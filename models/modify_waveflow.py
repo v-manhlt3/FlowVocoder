@@ -1,13 +1,7 @@
-# more faithful implementation to match as close as possible to the official WaveFlow release
-# https://github.com/PaddlePaddle/Parakeet/blob/develop/parakeet/models/waveflow/waveflow_modules.py
-
 from torch import nn
-import sys
-sys.path.append('/root/TTS-dir/WaveFlow/')
 from modules import Wavenet2D, Conv2D, ZeroConv2d
-from torch.distributions.normal import Normal
+from torch.distributions.normal import Normal 
 from functions import *
-
 
 class WaveFlowCoupling2D(nn.Module):
     def __init__(self, in_channel, cin_channel, filter_size=256, num_layer=6, num_height=None,
@@ -37,7 +31,6 @@ class WaveFlowCoupling2D(nn.Module):
         self.proj_log_s_t = ZeroConv2d(filter_size, 2*in_channel)
 
     def forward(self, x, c=None, debug=False):
-        print("input shape: ", x.shape)
         x_0, x_in = x[:, :, :1, :], x[:, :, :-1, :]
         c_in = c[:, :, 1:, :]
 
@@ -49,7 +42,6 @@ class WaveFlowCoupling2D(nn.Module):
         x_out = x[:, :, 1:, :]
         x_out, logdet_af = apply_affine_coupling_forward(x_out, log_s, t)
 
-        print(x_0.shape, x_out.shape)
         out = torch.cat((x_0, x_out), dim=2)
         logdet = torch.sum(log_s)
 
@@ -206,7 +198,7 @@ class WaveFlow(nn.Module):
 
     def forward(self, x, c, debug=False):
         x = x.unsqueeze(1)
-        B, _, T = x.size()
+        B, h, T = x.size()
         #  Upsample spectrogram to size of audio
         c = self.upsample(c)
         assert(c.size(2) >= x.size(2))
@@ -217,13 +209,17 @@ class WaveFlow(nn.Module):
         out = x
 
         logdet = 0
+        list_logdet = []
 
         if debug:
             list_log_s, list_t  = [], []
+        # print("number of flow block: ", self.n_flow)
 
         for i, flow in enumerate(self.flows):
             i_flow = i
             out, c, logdet_new, log_s, t = flow(out, c, i_flow, debug)
+            # print("logdet_new: ", logdet_new.shape)
+            list_logdet.append(logdet_new.sum().divide(B*h*T))
             if debug:
                 list_log_s.append(log_s)
                 list_t.append(t)
@@ -232,7 +228,8 @@ class WaveFlow(nn.Module):
         if debug:
             return out, logdet, list_log_s, list_t
         else:
-            return out, logdet
+            list_logdet = torch.tensor(list_logdet, requires_grad=True).to(x.device)
+            return out, logdet, list_logdet
 
     def reverse(self, c, temp=1.0, debug_z=None):
         # plain implementation of reverse ops

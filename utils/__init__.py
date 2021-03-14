@@ -23,6 +23,7 @@ from .torchutils import (
 
 from .trainutils import (
     build_model,
+    build_model_flowpp
 )
 
 from .typechecks import is_bool

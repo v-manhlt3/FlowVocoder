@@ -28,7 +28,7 @@ import argparse
 import json
 import os
 import torch
-from utils import build_model, get_lr, average_checkpoints, last_n_checkpoints
+from utils import build_model_flowpp, get_lr, average_checkpoints, last_n_checkpoints
 import time
 import gc
 
@@ -125,7 +125,7 @@ def save_checkpoint(model, optimizer, scheduler, learning_rate, iteration, filep
 
 def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_step, lr_decay_gamma,
           sigma, iters_per_checkpoint, batch_size, seed, fp16_run,
-          checkpoint_path, with_tensorboard):
+          checkpoint_path, with_tensorboard, scale_loss):
     # local eval and synth functions
     def evaluate():
         # eval loop
@@ -205,7 +205,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
                 model, optimizer, scheduler, iteration = load_averaged_checkpoint_warm_start(checkpoint_path, model,
                                                                                              optimizer, scheduler)
         else:
-            model, optimizer, scheduler, iteration = load_checkpoint(checkpoint_path, model,
+            model, _, scheduler, iteration = load_checkpoint(checkpoint_path, model,
                                                                      optimizer, scheduler)
         iteration += 1  # next iteration is iteration + 1
 
@@ -250,6 +250,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
         from tensorboardX import SummaryWriter
         logger = SummaryWriter(os.path.join(output_directory, waveflow_config["model_name"], 'logs'))
 
+    # scheduler = torch.optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=0.1, last_epoch)
     model.train()
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
@@ -264,9 +265,15 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
             mel = torch.autograd.Variable(mel.cuda())
             audio = torch.autograd.Variable(audio.cuda())
             outputs = model(audio, mel)
-            # print("loss logdet: ", outputs[2][0].sum().item())
+            # print("loss logdet: ", outputs[1])
 
             loss = criterion(outputs)
+            loss = loss*scale_loss
+            if torch.isnan(loss):
+                print("!!! Loss is NaN")
+                continue
+            # if scale_loss is not None:
+            #     loss = loss*scale_loss
             if num_gpus > 1:
                 reduced_loss = loss.mean().item()
             else:
@@ -360,7 +367,7 @@ def synthesize_master(model, num_gpus, temp, output_directory, epochs, learning_
 
             torch.cuda.synchronize()
             tic = time.time()
-            audio = model.reverse_fast(mel, temp)
+            audio = model.reverse(mel, temp)
             torch.cuda.synchronize()
             toc = time.time() - tic
 
@@ -403,13 +410,15 @@ if __name__ == "__main__":
     data_config = config["data_config"]
     global waveflow_config
     waveflow_config = config["waveflow_config"]
+    waveflow_config["model_name"] = "flowpp-waveflow-h16-r64-bipartize"
 
     num_gpus = torch.cuda.device_count()
 
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
 
-    model = build_model(waveflow_config)
+    model = build_model_flowpp(waveflow_config)
+    
 
     if args.synthesize:
         print("INFO: --synthesize is true. running only synthesize loop...")

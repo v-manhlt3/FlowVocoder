@@ -1,5 +1,10 @@
 import torch
-import torch.nn as nn
+
+import utils
+
+from torch import nn
+from torch.nn import functional as F, init
+from torch.nn.utils import weight_norm
 
 @torch.jit.script
 def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
@@ -16,6 +21,21 @@ def fused_res_skip(tensor, res_skip, n_channels):
     res = res_skip[:, :n_channels_int]
     skip = res_skip[:, n_channels_int:]
     return (tensor + res), skip
+
+class Rescale(nn.Module):
+    """Per-channel rescaling. Need a proper `nn.Module` so we can wrap it
+    with `torch.nn.utils.weight_norm`.
+    Args:
+        num_channels (int): Number of channels in the input.
+    """
+
+    def __init__(self, num_channels):
+        super(Rescale, self).__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels, 1, 1))
+
+    def forward(self, x):
+        x = self.weight * x
+        return x
 
 class Conv2D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation_h=1, dilation_w=1,
@@ -46,6 +66,10 @@ class Conv2D(nn.Module):
         return out
 
 
+def concat_elu(x):
+    axis = len(x.size()) - 1
+    return torch.nn.functional.elu(torch.cat((x, -x), dim=1))
+
 class ZeroConv2d(nn.Module):
     def __init__(self, in_channel, out_channel):
         super().__init__()
@@ -55,7 +79,8 @@ class ZeroConv2d(nn.Module):
         self.conv.bias.data.zero_()
 
     def forward(self, x):
-        out = self.conv(x)
+        out = concat_elu(x)
+        out = self.conv(out)
         return out
 
 class ResBlock2D(nn.Module):
@@ -178,3 +203,202 @@ class Wavenet2D(nn.Module):
             if x.type() == 'torch.cuda.HalfTensor':
                 conv_queue = conv_queue.half()
             self.conv_queues.append(conv_queue)
+
+
+class ConvAttnBlock(nn.Module):
+    def __init__(self, num_channels, drop_prob, use_attn, aux_channels):
+        super(ConvAttnBlock, self).__init__()
+        self.conv = GatedConv(num_channels, drop_prob, aux_channels)
+        self.norm_1 = nn.LayerNorm(num_channels)
+
+
+    def forward(self, x, aux=None):
+        x = self.conv(x, aux) + x
+        x = x.permute(0, 2, 3, 1)  # (b, h, w, c)
+        x = self.norm_1(x)
+
+        x = x.permute(0, 3, 1, 2)  # (b, c, h, w)
+
+        return x
+
+class WNConv2d(nn.Module):
+    """Weight-normalized 2d convolution.
+    Args:
+        in_channels (int): Number of channels in the input.
+        out_channels (int): Number of channels in the output.
+        kernel_size (int): Side length of each convolutional kernel.
+        padding (int): Padding to add on edges of input.
+        bias (bool): Use bias in the convolution operation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, padding, bias=True):
+        super(WNConv2d, self).__init__()
+        self.conv = nn.utils.weight_norm(
+            nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=bias))
+
+    def forward(self, x):
+        # print(x.shape)
+        x = self.conv(x)
+        return x
+
+
+class GatedConv(nn.Module):
+    """Gated Convolution Block
+    Originally used by PixelCNN++ (https://arxiv.org/pdf/1701.05517).
+    Args:
+        num_channels (int): Number of channels in hidden activations.
+        drop_prob (float): Dropout probability.
+        aux_channels (int): Number of channels in optional auxiliary input.
+    """
+    def __init__(self, num_channels, drop_prob=0., aux_channels=None):
+        super(GatedConv, self).__init__()
+        self.nlin = concat_elu
+        # print("gate conv")
+        self.conv = WNConv2d(2 * num_channels, num_channels, kernel_size=3, padding=1)
+        self.drop = nn.Dropout2d(drop_prob)
+        # print("gate gate conv")
+        self.gate = WNConv2d(2 * num_channels, 2*num_channels, kernel_size=1, padding=0)
+        if aux_channels is not None:
+            self.aux_conv = WNConv2d(2 * aux_channels, num_channels, kernel_size=1, padding=0)
+        else:
+            self.aux_conv = None
+
+    def forward(self, x, aux=None):
+        x = self.nlin(x)
+        x = self.conv(x)
+        if aux is not None:
+            aux = self.nlin(aux)
+            x = x + self.aux_conv(aux)
+        x = self.nlin(x)
+        x = self.drop(x)
+        x = self.gate(x)
+        a, b = x.chunk(2, dim=1)
+        x = a * torch.sigmoid(b)
+
+        return x
+
+class NN(nn.Module):
+    """Neural network used to parametrize the transformations of an MLCoupling.
+    An `NN` is a stack of blocks, where each block consists of the following
+    two layers connected in a residual fashion:
+      1. Conv: input -> nonlinearit -> conv3x3 -> nonlinearity -> gate
+      2. Attn: input -> conv1x1 -> multihead self-attention -> gate,
+    where gate refers to a 1×1 convolution that doubles the number of channels,
+    followed by a gated linear unit (Dauphin et al., 2016).
+    The convolutional layer is identical to the one used by PixelCNN++
+    (Salimans et al., 2017), and the multi-head self attention mechanism we
+    use is identical to the one in the Transformer (Vaswani et al., 2017).
+    Args:
+        in_channels (int): Number of channels in the input.
+        num_channels (int): Number of channels in each block of the network.
+        num_blocks (int): Number of blocks in the network.
+        num_components (int): Number of components in the mixture.
+        drop_prob (float): Dropout probability.
+        use_attn (bool): Use attention in each block.
+        aux_channels (int): Number of channels in optional auxiliary input.
+    """
+    def __init__(self, in_channels, num_channels, num_blocks, num_components, drop_prob, use_attn=True, aux_channels=None):
+        super(NN, self).__init__()
+        self.k = num_components  # k = number of mixture components
+        self.in_conv = WNConv2d(in_channels, num_channels, kernel_size=3, padding=1)
+        # print("in channels: ", in_channels)
+        # print("num channels: ", num_channels)
+        self.mid_convs = nn.ModuleList([ConvAttnBlock(num_channels, drop_prob, use_attn, aux_channels)
+                                        for _ in range(num_blocks)])
+        self.out_conv = WNConv2d(num_channels, in_channels * (2 + 3 * self.k),
+                                 kernel_size=3, padding=1)
+        self.rescale = weight_norm(Rescale(in_channels))
+
+    def forward(self, x, aux=None):
+        b, c, h, w = x.size()
+        x = self.in_conv(x)
+        for conv in self.mid_convs:
+            x = conv(x, aux)
+        x = self.out_conv(x)
+
+        # Split into components and post-process
+        x = x.view(b, -1, c, h, w)
+        s, t, pi, mu, scales = x.split((1, 1, self.k, self.k, self.k), dim=1)
+        s = self.rescale(torch.tanh(s.squeeze(1)))
+        t = t.squeeze(1)
+        scales = scales.clamp(min=-7)  # From the code in original Flow++ paper
+
+        return s, t, pi, mu, scales
+
+
+# class MADE(nn.Module):
+#     """Implementation of MADE.
+#     It can use either feedforward blocks or residual blocks (default is residual).
+#     Optionally, it can use batch norm or dropout within blocks (default is no).
+#     """
+
+#     def __init__(self,
+#                  features,
+#                  hidden_features,
+#                  context_features=None,
+#                  num_blocks=2,
+#                  output_multiplier=1,
+#                  use_residual_blocks=True,
+#                  random_mask=False,
+#                  activation=F.relu,
+#                  dropout_probability=0.,
+#                  use_batch_norm=False):
+#         if use_residual_blocks and random_mask:
+#             raise ValueError('Residual blocks can\'t be used with random masks.')
+#         super().__init__()
+
+#         # Initial layer.
+#         self.initial_layer = MaskedLinear(
+#             in_degrees=_get_input_degrees(features),
+#             out_features=hidden_features,
+#             autoregressive_features=features,
+#             random_mask=random_mask,
+#             is_output=False
+#         )
+
+#         if context_features is not None:
+#             self.context_layer = nn.Linear(context_features, hidden_features)
+
+#         # Residual blocks.
+#         blocks = []
+#         if use_residual_blocks:
+#             block_constructor = MaskedResidualBlock
+#         else:
+#             block_constructor = MaskedFeedforwardBlock
+#         prev_out_degrees = self.initial_layer.degrees
+#         for _ in range(num_blocks):
+#             blocks.append(
+#                 block_constructor(
+#                     in_degrees=prev_out_degrees,
+#                     autoregressive_features=features,
+#                     context_features=context_features,
+#                     random_mask=random_mask,
+#                     activation=activation,
+#                     dropout_probability=dropout_probability,
+#                     use_batch_norm=use_batch_norm,
+#                 )
+#             )
+#             prev_out_degrees = blocks[-1].degrees
+#         self.blocks = nn.ModuleList(blocks)
+
+#         # Final layer.
+#         self.final_layer = MaskedLinear(
+#             in_degrees=prev_out_degrees,
+#             out_features=features * output_multiplier,
+#             autoregressive_features=features,
+#             random_mask=random_mask,
+#             is_output=True
+#         )
+
+#     def forward(self, inputs, context=None):
+#         outputs = self.initial_layer(inputs)
+#         if context is not None:
+#             outputs += self.context_layer(context)
+#         for block in self.blocks:
+#             outputs = block(outputs, context)
+#         outputs = self.final_layer(outputs)
+#         return outputs
+
+# from torchsummary import summary
+
+# made = MADE(128, 256)
+# print(summary(made, 128, 64, 16000/64))

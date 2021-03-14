@@ -1,21 +1,38 @@
-# more faithful implementation to match as close as possible to the official WaveFlow release
-# https://github.com/PaddlePaddle/Parakeet/blob/develop/parakeet/models/waveflow/waveflow_modules.py
-
 from torch import nn
 import sys
 sys.path.append('/root/TTS-dir/WaveFlow/')
-from modules import Wavenet2D, Conv2D, ZeroConv2d
-from torch.distributions.normal import Normal
-from functions import *
+from modules import Wavenet2D, Conv2D, ZeroConv2d, NN
 
+
+from utils import log_dist as logistic
+from torch.nn.utils import weight_norm
+from torch.distributions.normal import Normal 
+from functions import *
+from utils.log_dist import Sigmoid 
+
+class Rescale(nn.Module):
+    """Per-channel rescaling. Need a proper `nn.Module` so we can wrap it
+    with `torch.nn.utils.weight_norm`.
+    Args:
+        num_channels (int): Number of channels in the input.
+    """
+
+    def __init__(self, num_channels):
+        super(Rescale, self).__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels, 1, 1))
+
+    def forward(self, x):
+        x = self.weight * x
+        return x
 
 class WaveFlowCoupling2D(nn.Module):
     def __init__(self, in_channel, cin_channel, filter_size=256, num_layer=6, num_height=None,
-                 layers_per_dilation_h_cycle=3):
+                 layers_per_dilation_h_cycle=3, k=32):
         super().__init__()
         assert num_height is not None
         self.in_channel = in_channel
         self.num_height = num_height
+        self.k = k
         self.layers_per_dilation_h_cycle = layers_per_dilation_h_cycle
         # dilation for width & height generation loop
         self.dilation_h = []
@@ -33,25 +50,49 @@ class WaveFlowCoupling2D(nn.Module):
                              kernel_size=3, cin_channels=cin_channel, dilation_h=self.dilation_h,
                              dilation_w=self.dilation_w)
 
+        self.rescale = weight_norm(Rescale(in_channel))
+        self.scale_flow = Sigmoid()
         # projector for log_s and t
-        self.proj_log_s_t = ZeroConv2d(filter_size, 2*in_channel)
+        ## split output to a, b, pi, mu, scales
+        self.proj_log_s_t = ZeroConv2d(filter_size*2, (2+3*self.k)*in_channel)
+        # self.nn = NN(in_channel, 64, num_blocks=5, num_components=32,drop_prob=0.0)
 
     def forward(self, x, c=None, debug=False):
-        print("input shape: ", x.shape)
         x_0, x_in = x[:, :, :1, :], x[:, :, :-1, :]
         c_in = c[:, :, 1:, :]
+        b, ch, h, w = x_in.size()
 
         feat = self.net(x_in, c_in)
-        log_s_t = self.proj_log_s_t(feat)
-        log_s = log_s_t[:, :self.in_channel]
-        t = log_s_t[:, self.in_channel:]
-
+        # feat = self.proj_log_s_t(feat)
+        # print("Feat shape: ", feat.shape)
+        """
+        compute mixture logistic data-parameterized family: a, b, pi, mu, scale 
+        y_1 = x_1
+        y_2 = inver-sigmoid(MixLogCDF(x_2, pi, mu, scale))*exp(a) + b 
+        """
+        # a, b, pi, mu, scales = self.nn(feat)
+        parametric = self.proj_log_s_t(feat)
+        parametric = parametric.view(b, -1, ch, h, w)
+        a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
+        # print("a shape: {} ---- b shape: {}".format(a.shape, b.shape))
+        para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
+        pi, mu, scales = para_split[0], para_split[1], para_split[2]
+        a = self.rescale(torch.tanh(a))
+        # b = b.squeeze(1)
+        scales = scales.clamp(min=-9)
+        # a = self.rescale(torch.tanh(a.squeeze(1)))
+        ####################################################################################
         x_out = x[:, :, 1:, :]
-        x_out, logdet_af = apply_affine_coupling_forward(x_out, log_s, t)
+        x_out = logistic.mixture_log_cdf(x_out, pi, mu, scales).exp()
+        x_out, scale_ldj = self.scale_flow.forward(x_out)
+        x_out = x_out*torch.exp(a) + b
 
-        print(x_0.shape, x_out.shape)
+        # logdet = 0
+        logistic_ldj = logistic.mixture_log_pdf(x[:, :, 1:, :], pi, mu, scales)
+        logdet = torch.flatten(logistic_ldj + a + scale_ldj).sum(-1)
+
         out = torch.cat((x_0, x_out), dim=2)
-        logdet = torch.sum(log_s)
+
 
         if debug:
             return out, logdet, log_s, t
@@ -69,12 +110,39 @@ class WaveFlowCoupling2D(nn.Module):
         c_cache = torch.stack(c_cache)  # [num_layers, batch_size, res_channels, width, height]
 
         for i_h in range(1, self.num_height):
+            b, ch,h, w = x.size()
             feat = self.net.reverse(x, c_cache[:, :, :, 1:i_h+1, :])[:, :, -1, :].unsqueeze(2)
-            log_s_t = self.proj_log_s_t(feat)
-            log_s = log_s_t[:, :self.in_channel]
-            t = log_s_t[:, self.in_channel:]
+            # feat = self.proj_log_s_t(feat)
 
-            x_new = apply_affine_coupling_inverse(z[:, :, i_h, :].unsqueeze(2), log_s, t).unsqueeze(2)
+            """ compute inver data-parameterized family"""
+            # a, b, pi, mu, scales = self.nn(feat)
+
+            parametric = self.proj_log_s_t(feat)
+            parametric = parametric.view(b, -1, ch, 1, w)
+            a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
+            para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
+            # print("para splip ", len(para_split))
+            pi, mu, scales = para_split[0], para_split[1], para_split[2]
+            a = self.rescale(torch.tanh(a))
+            # b = b.squeeze(1)
+            scales = scales.clamp(min=-9)
+            
+            # print("b shape: ", b.shape)
+            # print("a shape: ", a.shape)
+            # x_new = z[:, :, i_h:i_h+1, :].float() * a.mul(-1).exp() - b
+            # print("x_new origin shape", z[:, :, i_h:i_h+1, :].shape)
+            # x_new = z[:, :, i_h, :].unsqueeze(2)*torch.exp(-a) -b
+            x_new = (z[:, :, i_h, :].unsqueeze(2) - b)*torch.exp(-a)
+            # print("x_new affine inverse shape: ", x_new.shape)
+            x_new, scale_ldj = self.scale_flow.inverse(x_new)
+            x_new = x_new.clamp(1e-5, 1.0 - 1e-5)
+            x_new = logistic.mixture_inv_cdf(x_new, pi, mu, scales)
+            # print("x_new logistic inver shape: ", x_new.shape)
+            # logistic_ldj = logistic.mixture_log_pdf(x_new, pi, mu, scales)
+            # logdet = (a + scale_ldj + logistic_ldj).flatten(1).sum(-1) 
+            ########################################################################################
+            # print(x.shape, x_new.shape)
+            # x_new = apply_affine_coupling_inverse(z[:, :, i_h, :].unsqueeze(2), log_s, t).unsqueeze(2)
             x = torch.cat((x, x_new), 2)
 
         return x, c
@@ -93,11 +161,18 @@ class WaveFlowCoupling2D(nn.Module):
         for i_h in range(1, self.num_height):
             feat = self.net.reverse_fast(x_new, c_cache[:, :, :, i_h:i_h+1, :])[:, :, -1, :].unsqueeze(2)
 
-            log_s_t = self.proj_log_s_t(feat)
-            log_s = log_s_t[:, :self.in_channel]
-            t = log_s_t[:, self.in_channel:]
+            feat = self.proj_log_s_t(feat)
+            a, b, pi, mu, scales = self.nn(feat)
 
-            x_new = apply_affine_coupling_inverse(z[:, :, i_h, :].unsqueeze(2), log_s, t).unsqueeze(2)
+            # log_s = log_s_t[:, :self.in_channel]
+            # t = log_s_t[:, self.in_channel:]
+            x_new = z[:, :, i_h, :].unsqueeze(2)*torch.exp(-a) -b
+            # print("x_new affine inverse shape: ", x_new.shape)
+            x_new, scale_ldj = self.scale_flow.inverse(x_new)
+            x_new = x_new.clamp(1e-5, 1.0 - 1e-5)
+            x_new = logistic.mixture_inv_cdf(x_new, pi, mu, scales)
+
+            # x_new = apply_affine_coupling_inverse(z[:, :, i_h, :].unsqueeze(2), log_s, t).unsqueeze(2)
             x = torch.cat((x, x_new), 2)
 
         return x, c
@@ -146,6 +221,7 @@ class Flow(nn.Module):
                 z = bipartize_reverse_order(z)
                 c = bipartize_reverse_order(c)
             else:
+                # print("shape of c: ", c)
                 z = reverse_order(z)
                 c = reverse_order(c)
 
@@ -206,7 +282,7 @@ class WaveFlow(nn.Module):
 
     def forward(self, x, c, debug=False):
         x = x.unsqueeze(1)
-        B, _, T = x.size()
+        B, h, T = x.size()
         #  Upsample spectrogram to size of audio
         c = self.upsample(c)
         assert(c.size(2) >= x.size(2))
@@ -217,13 +293,17 @@ class WaveFlow(nn.Module):
         out = x
 
         logdet = 0
+        list_logdet = []
 
         if debug:
             list_log_s, list_t  = [], []
+        # print("number of flow block: ", self.n_flow)
 
         for i, flow in enumerate(self.flows):
             i_flow = i
             out, c, logdet_new, log_s, t = flow(out, c, i_flow, debug)
+            # print("logdet_new: ", logdet_new.shape)
+            list_logdet.append(logdet_new.sum().divide(B*h*T))
             if debug:
                 list_log_s.append(log_s)
                 list_t.append(t)
@@ -232,7 +312,8 @@ class WaveFlow(nn.Module):
         if debug:
             return out, logdet, list_log_s, list_t
         else:
-            return out, logdet
+            list_logdet = torch.tensor(list_logdet, requires_grad=True).to(x.device)
+            return out, logdet, list_logdet
 
     def reverse(self, c, temp=1.0, debug_z=None):
         # plain implementation of reverse ops
@@ -251,9 +332,10 @@ class WaveFlow(nn.Module):
             z = q_0.sample() * temp
         else:
             z = debug_z
-
+        # print("number of flow model: ", 8)
         for i, flow in enumerate(self.flows[::-1]):
             i_flow = self.n_flow - (i+1)
+            # print("reverse step: ", i)
             z, c = flow.reverse(z, c, i_flow)
 
         x = unsqueeze_to_1d(z, self.n_height)

@@ -33,7 +33,7 @@ import time
 import gc
 
 from torch.utils.data import DataLoader
-from models.loss import WaveFlowLossDataParallel
+from models.loss import WaveFlowLossDataParallel, DistillationLoss
 from mel2samp import Mel2Samp, MAX_WAV_VALUE
 from scipy.io.wavfile import write
 
@@ -123,9 +123,9 @@ def save_checkpoint(model, optimizer, scheduler, learning_rate, iteration, filep
                 'learning_rate': learning_rate}, filepath)
 
 
-def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_step, lr_decay_gamma,
+def train(teacher_model, model, num_gpus, output_directory, epochs, learning_rate, lr_decay_step, lr_decay_gamma,
           sigma, iters_per_checkpoint, batch_size, seed, fp16_run,
-          checkpoint_path, with_tensorboard):
+          checkpoint_path, with_tensorboard, teacher_checkpoint_path):
     # local eval and synth functions
     def evaluate():
         # eval loop
@@ -183,10 +183,13 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     criterion = WaveFlowLossDataParallel(sigma)
+    criterion_distil = DistillationLoss(2.0)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=lr_decay_step, gamma=lr_decay_gamma)
 
+    optimizer_t = torch.optim.Adam(teacher_model.parameters(), lr=learning_rate)
+    scheduler_t = torch.optim.lr_scheduler.StepLR(optimizer_t, step_size=lr_decay_step, gamma=lr_decay_gamma)
     if fp16_run:
         from apex import amp
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
@@ -208,6 +211,9 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
             model, optimizer, scheduler, iteration = load_checkpoint(checkpoint_path, model,
                                                                      optimizer, scheduler)
         iteration += 1  # next iteration is iteration + 1
+
+    teacher_model, _, _, _ = load_checkpoint(teacher_checkpoint_path, teacher_model,
+                                                                     optimizer_t, scheduler_t)
 
     if num_gpus > 1:
         print("num_gpus > 1. converting the model to DataParallel...")
@@ -251,6 +257,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
         logger = SummaryWriter(os.path.join(output_directory, waveflow_config["model_name"], 'logs'))
 
     model.train()
+    teacher_model.eval()
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, epochs):
@@ -264,19 +271,28 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
             mel = torch.autograd.Variable(mel.cuda())
             audio = torch.autograd.Variable(audio.cuda())
             outputs = model(audio, mel)
+
+            with torch.no_grad():
+                _,_, t_logdet = teacher_model(audio, mel)
+
             # print("loss logdet: ", outputs[2][0].sum().item())
 
             loss = criterion(outputs)
+            loss_distil = criterion_distil(t_logdet, outputs[2])
             if num_gpus > 1:
                 reduced_loss = loss.mean().item()
+                # reduced_loss_distil = loss_distil.mean().item()
+                reduced_loss_distil = loss_distil
             else:
                 reduced_loss = loss.item()
-
+                reduced_loss_distil = loss_distil
+            loss = 10*loss_distil + loss
             if fp16_run:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
                 loss.mean().backward()
+                # loss.backward()
 
             if fp16_run:
                 grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), 5.)
@@ -287,10 +303,12 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
             toc = time.time() - tic
 
             print("{}:\t{:.9f}, {:.4f} seconds".format(iteration, reduced_loss, toc))
+            print("{}: ---Distillation Loss: {}".format(iteration, reduced_loss_distil))
             if with_tensorboard:
                 logger.add_scalar('training_loss', reduced_loss, i + len(train_loader) * epoch)
                 logger.add_scalar('lr', get_lr(optimizer), i + len(train_loader) * epoch)
                 logger.add_scalar('grad_norm', grad_norm, i + len(train_loader) * epoch)
+                logger.add_scalar('distilation_loss', reduced_loss_distil, i + len(train_loader) * epoch)
                 logger.flush()
 
             if (iteration % iters_per_checkpoint == 0):
@@ -382,6 +400,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', type=str,
                         help='JSON file for configuration')
+    parser.add_argument('--c_t', '--config_t',type=str, help="JSON file for teacher configuration",
+                        default="./configs/waveflow-h16-r64-bipartize.json")
     parser.add_argument('-w', '--warm_start', action='store_true',
                         help='warm start. i.e. load_state_dict() with strict=False and optimizer & scheduler are initialized.')
     parser.add_argument('-s', '--synthesize', action='store_true',
@@ -403,6 +423,12 @@ if __name__ == "__main__":
     data_config = config["data_config"]
     global waveflow_config
     waveflow_config = config["waveflow_config"]
+    ####### load teacher JSON config ##############
+    with open(args.c_t) as f_t:
+        data_t = f_t.read()
+    config_t = json.loads(data_t)
+    waveflow_config_t = config_t["waveflow_config"]
+    ###############################################
 
     num_gpus = torch.cuda.device_count()
 
@@ -410,6 +436,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
 
     model = build_model(waveflow_config)
+    teacher_model = build_model(waveflow_config_t)
 
     if args.synthesize:
         print("INFO: --synthesize is true. running only synthesize loop...")
@@ -417,4 +444,4 @@ if __name__ == "__main__":
         print("INFO: synthesize loop done. exiting!")
         exit()
     else:
-        train(model, num_gpus, **train_config)
+        train(teacher_model, model, num_gpus, **train_config)
