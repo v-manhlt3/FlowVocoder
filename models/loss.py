@@ -20,7 +20,7 @@ class WaveFlowLossDataParallel(torch.nn.Module):
 
     def forward(self, model_output):
         out, logdet,_ = model_output
-        logdet = logdet.sum().double()
+        logdet = logdet.sum().float()
         B, h, C, T = out.size()
         # print("h: ", h)
         # print("out pow: {}---- logdet: {}".format(out.pow(2).sum(), logdet))

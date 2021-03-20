@@ -55,6 +55,7 @@ def bipartize_reverse_order(x, dim=2):
     :param x: tensor with shape [B, 1, H, W]
     :return:  same shape with permuted height
     """
+    # print("bipartize_reverse order shape: ", x.shape)
     B, _, H, W = x.size()
     assert H % 2 == 0, "height is not even number, bipartize behavior is undefined."
     # unsqueeze to (B, _, 1, H, W), reshape to (B, _, 2, H/2, W), then flip on dim with H/2
@@ -62,6 +63,28 @@ def bipartize_reverse_order(x, dim=2):
     x = x.view(B, _, 2, int(H/2), W)
     x = x.flip(dims=(dim+1,))
     x = x.view(B, _, -1, W)
+
+    return x
+
+def bipartize_reverse_order_c_cached(x, dim=2):
+    # permutation stragety (b) from waveflow paper
+    # ex: given [H, W] tensor:
+    # [0, 4,      [1, 5,
+    #  1, 5,       0, 4,
+    #  2, 6,       3, 7,
+    #  3, 7,] ==>  2, 6,]
+    """
+    :param x: tensor with shape [B, 1, H, W]
+    :return:  same shape with permuted height
+    """
+    # print("bipartize_reverse order shape: ", x.shape)
+    B, s1,s2, H, W = x.size()
+    assert H % 2 == 0, "height is not even number, bipartize behavior is undefined."
+    # unsqueeze to (B, _, 1, H, W), reshape to (B, _, 2, H/2, W), then flip on dim with H/2
+    x = x.unsqueeze(dim)
+    x = x.view(B, s1,s2, 2, int(H/2), W)
+    x = x.flip(dims=(dim+1,))
+    x = x.view(B, s1,s2, -1, W)
 
     return x
 

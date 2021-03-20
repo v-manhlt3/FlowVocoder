@@ -37,7 +37,7 @@ def mixture_log_cdf(x, prior_logits, means, log_scales):
 
 
 def mixture_inv_cdf(y, prior_logits, means, log_scales,
-                    eps=1e-22, max_iters=100):
+                    eps=1e-12, max_iters=200):
     """Inverse CDF of a mixture of logisitics. Iterative algorithm."""
     if y.min() <= 0 or y.max() >= 1:
         raise RuntimeError('Inverse logisitic CDF got y outside (0, 1)')

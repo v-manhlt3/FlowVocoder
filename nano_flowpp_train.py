@@ -1,34 +1,9 @@
-# *****************************************************************************
-#  Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-#  Redistribution and use in source and binary forms, with or without
-#  modification, are permitted provided that the following conditions are met:
-#      * Redistributions of source code must retain the above copyright
-#        notice, this list of conditions and the following disclaimer.
-#      * Redistributions in binary form must reproduce the above copyright
-#        notice, this list of conditions and the following disclaimer in the
-#        documentation and/or other materials provided with the distribution.
-#      * Neither the name of the NVIDIA CORPORATION nor the
-#        names of its contributors may be used to endorse or promote products
-#        derived from this software without specific prior written permission.
-#
-#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-#  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-#  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-#  DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE FOR ANY
-#  DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-#  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-#  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-#  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# *****************************************************************************
 import argparse
 import json
 import os
 import torch
-from utils import build_model_flowpp, get_lr, average_checkpoints, last_n_checkpoints
+from utils import build_model_nano_flowpp_nn
+from utils import build_model_nano_flowpp,get_lr, average_checkpoints, last_n_checkpoints
 import time
 import gc
 
@@ -125,8 +100,9 @@ def save_checkpoint(model, optimizer, scheduler, learning_rate, iteration, filep
 
 def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_step, lr_decay_gamma,
           sigma, iters_per_checkpoint, batch_size, seed, fp16_run,
-          checkpoint_path, with_tensorboard, scale_loss):
+          checkpoint_path, with_tensorboard):
     # local eval and synth functions
+    model.train()
     def evaluate():
         # eval loop
         model.eval()
@@ -155,14 +131,18 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
     def synthesize(sigma):
         model.eval()
         # synthesize loop
+        # model.h_cache = model.module.cache_flow_embed()
+
         for i, batch in enumerate(synth_loader):
             if i == 0:
                 with torch.no_grad():
                     mel, _, filename = batch
                     mel = torch.autograd.Variable(mel.cuda())
                     try:
+                        model.h_cache = model.cache_flow_embed()
                         audio = model.reverse(mel, sigma)
                     except AttributeError:
+                        model.module.h_cache = model.module.cache_flow_embed()
                         audio = model.module.reverse(mel, sigma)
                     except NotImplementedError:
                         print("reverse not implemented for this model. skipping synthesize!")
@@ -186,6 +166,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=lr_decay_step, gamma=lr_decay_gamma)
+    model.h_cache = model.cache_flow_embed()
 
     if fp16_run:
         from apex import amp
@@ -251,7 +232,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
         logger = SummaryWriter(os.path.join(output_directory, waveflow_config["model_name"], 'logs'))
 
     # scheduler = torch.optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=0.1, last_epoch)
-    model.train()
+    
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, epochs):
@@ -268,7 +249,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
             # print("loss logdet: ", outputs[1])
 
             loss = criterion(outputs)
-            loss = loss*scale_loss
+            # loss = loss*scale_loss
             if torch.isnan(loss):
                 print("!!! Loss is NaN")
                 continue
@@ -332,6 +313,7 @@ def synthesize_master(model, num_gpus, temp, output_directory, epochs, learning_
     model.remove_weight_norm()
     # fuse mel-spec conditioning layer weights to maximize speed
     model.fuse_conditioning_layers()
+    model.h_cache = model.module.cache_flow_embed()
 
     if fp16_run:
         from apex import amp
@@ -417,7 +399,11 @@ if __name__ == "__main__":
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
 
-    model = build_model_flowpp(waveflow_config)
+    """ model without NN block for computing transformation parameters"""
+    # model = build_model_nano_flowpp(waveflow_config)
+
+    """ testing NN for parameterizing transformation parameters"""
+    model = build_model_nano_flowpp_nn(waveflow_config)
     
 
     if args.synthesize:

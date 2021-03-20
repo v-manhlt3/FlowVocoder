@@ -23,7 +23,9 @@ from .torchutils import (
 
 from .trainutils import (
     build_model,
-    build_model_flowpp
+    build_model_flowpp,
+    build_model_nano_flowpp,
+    build_model_nano_flowpp_nn
 )
 
 from .typechecks import is_bool

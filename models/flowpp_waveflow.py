@@ -54,8 +54,9 @@ class WaveFlowCoupling2D(nn.Module):
         self.scale_flow = Sigmoid()
         # projector for log_s and t
         ## split output to a, b, pi, mu, scales
-        self.proj_log_s_t = ZeroConv2d(filter_size*2, (2+3*self.k)*in_channel)
-        # self.nn = NN(in_channel, 64, num_blocks=5, num_components=32,drop_prob=0.0)
+        self.proj = ZeroConv2d(filter_size, in_channel)
+        # self.proj_log_s_t = ZeroConv2d(filter_size*2, (2+3*self.k)*in_channel)
+        self.nn = NN(in_channel, 8, num_blocks=5, num_components=32,drop_prob=0.0)
 
     def forward(self, x, c=None, debug=False):
         x_0, x_in = x[:, :, :1, :], x[:, :, :-1, :]
@@ -63,26 +64,30 @@ class WaveFlowCoupling2D(nn.Module):
         b, ch, h, w = x_in.size()
 
         feat = self.net(x_in, c_in)
-        # feat = self.proj_log_s_t(feat)
+        feat = self.proj(feat)
         # print("Feat shape: ", feat.shape)
         """
         compute mixture logistic data-parameterized family: a, b, pi, mu, scale 
         y_1 = x_1
         y_2 = inver-sigmoid(MixLogCDF(x_2, pi, mu, scale))*exp(a) + b 
         """
-        # a, b, pi, mu, scales = self.nn(feat)
-        parametric = self.proj_log_s_t(feat)
-        parametric = parametric.view(b, -1, ch, h, w)
-        a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
+        a, b, pi, mu, scales = self.nn(feat)
+
+
+        # parametric = self.proj_log_s_t(feat)
+        # parametric = parametric.view(b, -1, ch, h, w)
+        # a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
         # print("a shape: {} ---- b shape: {}".format(a.shape, b.shape))
-        para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
-        pi, mu, scales = para_split[0], para_split[1], para_split[2]
-        a = self.rescale(torch.tanh(a))
-        # b = b.squeeze(1)
-        scales = scales.clamp(min=-9)
+        # para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
+        # pi, mu, scales = para_split[0], para_split[1], para_split[2]
+        # a = self.rescale(torch.tanh(a))
+        # # b = b.squeeze(1)
+        # scales = scales.clamp(min=-9)
         # a = self.rescale(torch.tanh(a.squeeze(1)))
         ####################################################################################
         x_out = x[:, :, 1:, :]
+        # print("in shape: ", x_out.shape)
+        # print("a shape{}, b shape {}".format(a.shape, b.shape))
         x_out = logistic.mixture_log_cdf(x_out, pi, mu, scales).exp()
         x_out, scale_ldj = self.scale_flow.forward(x_out)
         x_out = x_out*torch.exp(a) + b
@@ -91,6 +96,7 @@ class WaveFlowCoupling2D(nn.Module):
         logistic_ldj = logistic.mixture_log_pdf(x[:, :, 1:, :], pi, mu, scales)
         logdet = torch.flatten(logistic_ldj + a + scale_ldj).sum(-1)
 
+        # print("x in {}, x_out: {}".format(x_0.shape, x_out.shape))
         out = torch.cat((x_0, x_out), dim=2)
 
 
@@ -112,20 +118,18 @@ class WaveFlowCoupling2D(nn.Module):
         for i_h in range(1, self.num_height):
             b, ch,h, w = x.size()
             feat = self.net.reverse(x, c_cache[:, :, :, 1:i_h+1, :])[:, :, -1, :].unsqueeze(2)
-            # feat = self.proj_log_s_t(feat)
+            feat = self.proj(feat)
 
             """ compute inver data-parameterized family"""
-            # a, b, pi, mu, scales = self.nn(feat)
+            a, b, pi, mu, scales = self.nn(feat)
 
-            parametric = self.proj_log_s_t(feat)
-            parametric = parametric.view(b, -1, ch, 1, w)
-            a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
-            para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
-            # print("para splip ", len(para_split))
-            pi, mu, scales = para_split[0], para_split[1], para_split[2]
-            a = self.rescale(torch.tanh(a))
-            # b = b.squeeze(1)
-            scales = scales.clamp(min=-9)
+            # parametric = self.proj_log_s_t(feat)
+            # parametric = parametric.view(b, -1, ch, 1, w)
+            # a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
+            # para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
+            # pi, mu, scales = para_split[0], para_split[1], para_split[2]
+            # a = self.rescale(torch.tanh(a))
+            # scales = scales.clamp(min=-9)
             
             # print("b shape: ", b.shape)
             # print("a shape: ", a.shape)

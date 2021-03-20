@@ -25,7 +25,7 @@
         "mel_fmax": 8000.0
     },
     "waveflow_config": {
-      "model_name": "waveflow-h16-r64",
+      "model_name": "test-nanoflow",
       "cin_channels": 80,
       "res_channels": 64,
       "n_height": 16,
