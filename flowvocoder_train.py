@@ -1,34 +1,9 @@
-# *****************************************************************************
-#  Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-#  Redistribution and use in source and binary forms, with or without
-#  modification, are permitted provided that the following conditions are met:
-#      * Redistributions of source code must retain the above copyright
-#        notice, this list of conditions and the following disclaimer.
-#      * Redistributions in binary form must reproduce the above copyright
-#        notice, this list of conditions and the following disclaimer in the
-#        documentation and/or other materials provided with the distribution.
-#      * Neither the name of the NVIDIA CORPORATION nor the
-#        names of its contributors may be used to endorse or promote products
-#        derived from this software without specific prior written permission.
-#
-#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-#  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-#  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-#  DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE FOR ANY
-#  DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-#  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-#  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-#  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# *****************************************************************************
 import argparse
 import json
 import os
 import torch
-from utils import build_model_flowpp, get_lr, average_checkpoints, last_n_checkpoints
+from utils import build_model_flowvocoder
+from utils import build_model_nano_flowpp,get_lr, average_checkpoints, last_n_checkpoints
 import time
 import gc
 import numpy as np
@@ -38,6 +13,17 @@ from models.loss import WaveFlowLossDataParallel
 from mel2samp import Mel2Samp, MAX_WAV_VALUE
 from scipy.io.wavfile import write
 
+def stft(y, scale='linear'):
+    D = torch.stft(y, n_fft=1024, hop_length=256, win_length=1024)#, window=torch.hann_window(1024).cuda())
+    D = torch.sqrt(D.pow(2).sum(-1) + 1e-10)
+    # D = torch.sqrt(torch.clamp(D.pow(2).sum(-1), min=1e-10))
+    if scale == 'linear':
+        return D
+    elif scale == 'log':
+        S = 2 * torch.log(torch.clamp(D, 1e-10, float("inf")))
+        return S
+    else:
+        pass
 
 def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
     assert os.path.isfile(checkpoint_path)
@@ -126,8 +112,9 @@ def save_checkpoint(model, optimizer, scheduler, learning_rate, iteration, filep
 
 def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_step, lr_decay_gamma,
           sigma, iters_per_checkpoint, batch_size, seed, fp16_run,
-          checkpoint_path, with_tensorboard, scale_loss):
+          checkpoint_path, with_tensorboard):
     # local eval and synth functions
+    model.train()
     def evaluate():
         # eval loop
         model.eval()
@@ -156,14 +143,18 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
     def synthesize(sigma):
         model.eval()
         # synthesize loop
+        # model.h_cache = model.module.cache_flow_embed()
+
         for i, batch in enumerate(synth_loader):
             if i == 0:
                 with torch.no_grad():
                     mel, _, filename = batch
                     mel = torch.autograd.Variable(mel.cuda())
                     try:
+                        model.h_cache = model.cache_flow_embed()
                         audio = model.reverse(mel, sigma)
                     except AttributeError:
+                        model.module.h_cache = model.module.cache_flow_embed()
                         audio = model.module.reverse(mel, sigma)
                     except NotImplementedError:
                         print("reverse not implemented for this model. skipping synthesize!")
@@ -187,6 +178,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=lr_decay_step, gamma=lr_decay_gamma)
+    model.h_cache = model.cache_flow_embed()
 
     if fp16_run:
         from apex import amp
@@ -252,7 +244,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
         logger = SummaryWriter(os.path.join(output_directory, waveflow_config["model_name"], 'logs'))
 
     # scheduler = torch.optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=0.1, last_epoch)
-    model.train()
+    
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, epochs):
@@ -269,7 +261,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
             # print("loss logdet: ", outputs[1])
 
             loss = criterion(outputs)
-            loss = loss*scale_loss
+            # loss = loss*scale_loss
             if torch.isnan(loss):
                 print("!!! Loss is NaN")
                 continue
@@ -325,14 +317,15 @@ def synthesize_master(model, num_gpus, temp, output_directory, epochs, learning_
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
+    model.h_cache = model.cache_flow_embed()
     # Load checkpoint if one exists
     iteration = 0
     if checkpoint_path != "":
         model, _, _, iteration = load_checkpoint(checkpoint_path, model, None, None)
     # remove all weight_norm from the model
-    model.remove_weight_norm()
+    # model.remove_weight_norm()
     # fuse mel-spec conditioning layer weights to maximize speed
-    model.fuse_conditioning_layers()
+    
 
     if fp16_run:
         from apex import amp
@@ -378,13 +371,15 @@ def synthesize_master(model, num_gpus, temp, output_directory, epochs, learning_
         audio = audio.squeeze()
         audio = audio.cpu().numpy()
         audio = audio.astype('int16')
+        # audio_path = os.path.join(
+        #     os.path.join(output_directory, "samples", waveflow_config["model_name"]),
+        #     "generate_{}_{}_t{}.wav".format(iteration, i, temp))
         audio_path = os.path.join(
-            os.path.join(output_directory, "samples", waveflow_config["model_name"]),
-            "generate_{}_{}_t{}.wav".format(iteration, i, temp))
+            os.path.join(output_directory, "samples", "MOS-5"),
+            filename[0].split("/")[-1])
         write(audio_path, data_config["sampling_rate"], audio)
 
     model.train()
-
 
 def synthesize_tacotron2(model, num_gpus, temp, output_directory, epochs, learning_rate, lr_decay_step, lr_decay_gamma,
                       sigma, iters_per_checkpoint, batch_size, seed, fp16_run,
@@ -405,7 +400,7 @@ def synthesize_tacotron2(model, num_gpus, temp, output_directory, epochs, learni
     # remove all weight_norm from the model
     # model.remove_weight_norm()
     # fuse mel-spec conditioning layer weights to maximize speed
-    model.fuse_conditioning_layers()
+    # model.fuse_conditioning_layers()
     # model.h_cache = model.cache_flow_embed()
 
     list_mel = glob.glob("./gen_tacotron2/*.npy")
@@ -436,8 +431,8 @@ def synthesize_tacotron2(model, num_gpus, temp, output_directory, epochs, learni
                 mel = mel.half()
             torch.cuda.synchronize()
             tic = time.time()
-            model.h_cache = model.cache_flow_embed()
-            audio = model.reverse_fast(mel, temp)
+            # model.h_cache = model.cache_flow_embed()
+            audio = model.reverse(mel, temp)
             torch.cuda.synchronize()
             toc = time.time() - tic
             print('{:.4f} seconds, {:.4f}kHz'.format(toc, audio.shape[1] / toc / 1000))
@@ -480,14 +475,18 @@ if __name__ == "__main__":
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
 
-    model = build_model_flowpp(waveflow_config)
-    
-    synthesize_tacotron2(model, num_gpus, args.temp, **train_config)
+    """ model without NN block for computing transformation parameters"""
+    # model = build_model_nano_flowpp(waveflow_config)
 
-    # if args.synthesize:
-    #     print("INFO: --synthesize is true. running only synthesize loop...")
-    #     synthesize_master(model, num_gpus, args.temp, **train_config)
-    #     print("INFO: synthesize loop done. exiting!")
-    #     exit()
-    # else:
-    #     train(model, num_gpus, **train_config)
+    """ testing NN for parameterizing transformation parameters"""
+    model = build_model_flowvocoder(waveflow_config)
+    
+    # synthesize_tacotron2(model, num_gpus, args.temp, **train_config)
+
+    if args.synthesize:
+        print("INFO: --synthesize is true. running only synthesize loop...")
+        synthesize_master(model, num_gpus, args.temp, **train_config)
+        print("INFO: synthesize loop done. exiting!")
+        exit()
+    else:
+        train(model, num_gpus, **train_config)

@@ -25,7 +25,7 @@ from .trainutils import (
     build_model,
     build_model_flowpp,
     build_model_nano_flowpp,
-    build_model_nano_flowpp_nn
+    build_model_flowvocoder
 )
 
 from .typechecks import is_bool

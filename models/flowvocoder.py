@@ -10,6 +10,10 @@ from torch.distributions.normal import Normal
 from functions import *
 from utils.log_dist import Sigmoid 
 
+
+
+
+
 class Rescale(nn.Module):
     """Per-channel rescaling. Need a proper `nn.Module` so we can wrap it
     with `torch.nn.utils.weight_norm`.
@@ -63,10 +67,10 @@ class WaveNet2DHyperDensityEstimator(nn.Module):
         # out = self.proj(out)
         return out
 
-    # def reverse_fast(self, x, c=None, context=None, multgate=None, debug=False):
-    #     out = self.net.reverse_fast(x, c, context, multgate)
-    #     out = self.proj(out)
-    #     return out
+    def reverse_fast(self, x, c=None, context=None, multgate=None, debug=False):
+        out = self.net.reverse_fast(x, c, context, multgate)
+        # out = self.proj(out)
+        return out
 
     # def reverse_faster(self, x, c=None, multgate=None, debug=False):
     #     out = self.net.reverse_faster(x, c, multgate)
@@ -79,8 +83,8 @@ class Flow(nn.Module):
         super().__init__()
 
         self.k = 32
-        self.layer_density_estimator = NN(in_channel, 32, num_blocks=5, num_components=32, drop_prob=0, filter_size=filter_size)
-        # self.layer_density_estimator = ZeroConv2d(filter_size*2, (2+3*self.k)*in_channel)
+        # self.layer_density_estimator = NN(in_channel, 32, num_blocks=5, num_components=32, drop_prob=0, filter_size=filter_size)
+        self.layer_density_estimator = ZeroConv2d(filter_size*2, (2+3*self.k)*in_channel)
         self.multgate = nn.Parameter(torch.ones(num_layer, filter_size))
         self.n_flow = n_flow  # useful for selecting permutation
         self.bipartize = bipartize
@@ -92,48 +96,32 @@ class Flow(nn.Module):
     def forward(self, estimator, x, c=None,i=None, embedding=None,debug=False):
         logdet = 0
 
-        x_0, x_in = x[:, :, :1, :], x[:, :, :-1, :]
-        c_in = c[:, :, 1:, :]
-        b, ch, h, w = x_in.size()
+        x = reverse_order(x)
+        c = reverse_order(c)
 
-        feat = estimator(x_in, c_in, embedding, self.multgate)
+        x_shift = shift_1d(x)
 
-        # parametric = self.layer_density_estimator(feat)
-        # parametric = parametric.view(b, -1, ch, h, w)
-        # a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
-        # para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
-        # pi, mu, scales = para_split[0], para_split[1], para_split[2]
-        # a = self.rescale(torch.tanh(a))
-        # scales = scales.clamp(min=-9)
+        b, ch, h, w = x_shift.size()
 
-        a, b, pi, mu, scales = self.layer_density_estimator(feat)
+        feat = estimator(x_shift, c, embedding, self.multgate)
 
-        x_out = x[:, :, 1:, :]
+        # a, b, pi, mu, scales = self.layer_density_estimator(feat)
+        parametric = self.layer_density_estimator(feat)
+        parametric = parametric.view(b, -1, ch, h, w)
+        a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
+        para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
+        pi, mu, scales = para_split[0], para_split[1], para_split[2]
+        a = self.rescale(torch.tanh(a))
+        scales = scales.clamp(min=-9)
+
+        x_out = x
         x_out = logistic.mixture_log_cdf(x_out, pi, mu, scales).exp()
         x_out, scale_ldj = self.scale_flow.forward(x_out)
-        x_out = x_out*torch.exp(a) + b
+        out = x_out*torch.exp(a) + b
 
-        logistic_ldj = logistic.mixture_log_pdf(x[:, :, 1:, :], pi, mu, scales)
+        logistic_ldj = logistic.mixture_log_pdf(x, pi, mu, scales)
         logdet = torch.flatten(logistic_ldj + a + scale_ldj).sum(-1)
 
-        # print(x_0.shape, x_out.shape)
-        out = torch.cat((x_0, x_out), dim=2)
-
-        if i < int(self.n_flow / 2):
-             # vanilla reverse_order ops
-            out = reverse_order(out)
-            c = reverse_order(c, dim=3)
-        else:
-            if self.bipartize:
-                # bipartization & reverse_order ops
-                out = bipartize_reverse_order(out)
-                c = bipartize_reverse_order(c)
-            else:
-                out = reverse_order(out)
-                c = reverse_order(c)
-        
-        # out, logdet_af, log_s, t = self.coupling(x, c, debug)
-        # logdet = logdet + logdet_af
 
         if debug:
             return out, c, logdet, log_s, t
@@ -141,42 +129,24 @@ class Flow(nn.Module):
             return out, c, logdet, None, None
 
     def reverse(self,estimator, z, c, i, embedding):
-        if i < int(self.n_flow / 2):
-            z = reverse_order(z)
-            c = reverse_order(c, dim=3)
-        else:
-            if self.bipartize:
-                z = bipartize_reverse_order(z)
-                c = bipartize_reverse_order_c_cached(c, dim=3)
-            else:
-                z = reverse_order(z)
-                c = reverse_order(c, dim=3)
-        x = z[:, :, 0:1, :]
-        # print(z.shape, c.shape)
+        # x = z[:, :, 0:1, :]
+        x = torch.zeros_like(z[:, :, 0:1, :])
 
-        # c_cache = []
-        # for i, resblock in enumerate(self.net.res_blocks):
-        #     filter_gate_conv_c = resblock.filter_gate_conv_c(c)
-        #     c_cache.append(filter_gate_conv_c)
-        # c_cache = torch.stack(c_cache)
-        for i_h in range(1, self.num_height):
+        for i_h in range(0, self.num_height):
             b, ch,h, w = x.size()
-            # print("flow: {}, x shape: {}------ c shape: {}".format(i_h, x.shape, c[:, :, :, :i_h+1, :].shape))
-            feat = estimator.reverse(x, c[:, :, :, 1:i_h+1, :], embedding[:, :, :, :i_h + 1, :]
+            feat = estimator.reverse(x, c[:, :, :, :i_h+1, :], embedding[:, :, :, :i_h + 1, :]
                     , self.multgate)[:, :, -1, :].unsqueeze(2)
-            # feat = self.proj(feat)
 
-            """ compute inver data-parameterized family"""
-            # parametric = self.layer_density_estimator(feat)
-            # parametric = parametric.view(b, -1, ch, 1, w)
-            # a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
-            # para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
-            # # print("len of para split: ", len(para_split))
-            # pi, mu, scales = para_split[0], para_split[1], para_split[2]
-            # a = self.rescale(torch.tanh(a))
-            # scales = scales.clamp(min=-9)
+            """ compute inver data-parameterized family """
+            parametric = self.layer_density_estimator(feat)
+            parametric = parametric.view(b, -1, ch, 1, w)
+            a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
+            para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
+            pi, mu, scales = para_split[0], para_split[1], para_split[2]
+            a = self.rescale(torch.tanh(a))
+            scales = scales.clamp(min=-9)
 
-            a, b, pi, mu, scales = self.layer_density_estimator(feat, reverse=True)
+            # a, b, pi, mu, scales = self.layer_density_estimator(feat, reverse=True)
 
             x_new = (z[:, :, i_h, :].unsqueeze(2) - b)*torch.exp(-a)
             x_new, scale_ldj = self.scale_flow.inverse(x_new)
@@ -184,27 +154,48 @@ class Flow(nn.Module):
             x_new = logistic.mixture_inv_cdf(x_new, pi, mu, scales)
             x = torch.cat((x, x_new), 2)
 
-        z, c = x, c
-        # z = reverse_order(z)
-        # c = reverse_order(c, dim=3)
+        # z, c = x, c
+        x = x[:,:,1:,:]
 
-        return z, c
+        x = reverse_order(x)
+        c = reverse_order(c, dim=3)
 
-    # def reverse_fast(self, z, c, i):
-    #     if i < int(self.n_flow / 2):
-    #         z = reverse_order(z)
-    #         c = reverse_order(c)
-    #     else:
-    #         if self.bipartize:
-    #             z = bipartize_reverse_order(z)
-    #             c = bipartize_reverse_order(c)
-    #         else:
-    #             z = reverse_order(z)
-    #             c = reverse_order(c)
+        return x, c
 
-    #     z, c = self.coupling.reverse_fast(z, c)
+    def reverse_fast(self, estimator,z, c, i, embedding):
+        # x = z[:, :, 0:1, :]
+        x = torch.zeros_like(z[:, :, 0:1, :])
+        estimator.net.conv_queue_init(x)
 
-    #     return z, c
+        for i_h in range(0, self.num_height):
+            b, ch,h, w = x.size()
+            feat = estimator.reverse(x, c[:, :, :, :i_h+1, :], embedding[:, :, :, :i_h + 1, :]
+                    , self.multgate)[:, :, -1, :].unsqueeze(2)
+
+            """ compute inver data-parameterized family """
+            parametric = self.layer_density_estimator(feat)
+            parametric = parametric.view(b, -1, ch, 1, w)
+            a, b = parametric[:, 0, :, :,  :], parametric[:, 1, :, :, :]
+            para_split = torch.split(parametric[:, 2:, :, :, :], self.k, dim=1)
+            pi, mu, scales = para_split[0], para_split[1], para_split[2]
+            a = self.rescale(torch.tanh(a))
+            scales = scales.clamp(min=-9)
+
+            # a, b, pi, mu, scales = self.layer_density_estimator(feat, reverse=True)
+
+            x_new = (z[:, :, i_h, :].unsqueeze(2) - b)*torch.exp(-a)
+            x_new, scale_ldj = self.scale_flow.inverse(x_new)
+            x_new = x_new.clamp(1e-5, 1.0 - 1e-5)
+            x_new = logistic.mixture_inv_cdf(x_new, pi, mu, scales)
+            x = torch.cat((x, x_new), 2)
+
+        # z, c = x, c
+        x = x[:,:,1:,:]
+
+        x = reverse_order(x)
+        c = reverse_order(c, dim=3)
+
+        return x, c
 
 
 class WaveFlow(nn.Module):
@@ -352,31 +343,41 @@ class WaveFlow(nn.Module):
 
         return x
 
-    # def reverse_fast(self, c, temp=1.0, debug_z=None):
-    #     # optimized reverse without redundant computations from conv queue
-    #     c = self.upsample(c)
-    #     # trim conv artifacts. maybe pad spec to kernel multiple
-    #     time_cutoff = self.upsample_conv_kernel_size - self.upsample_conv_stride
-    #     c = c[:, :, :-time_cutoff]
+    def reverse_fast(self, c, temp=1.0, debug_z=None):
+        c = self.upsample(c)
+        # trim conv artifacts. maybe pad spec to kernel multiple
+        time_cutoff = self.upsample_conv_kernel_size - self.upsample_conv_stride
+        c = c[:, :, :-time_cutoff]
 
-    #     B, _, T_c = c.size()
+        B, _, T_c = c.size()
 
-    #     _, c = squeeze_to_2d(None, c, h=self.n_height)
+        _, c = squeeze_to_2d(None, c, h=self.n_height)
 
-    #     if debug_z is None:
-    #         # sample gaussian noise that matches c
-    #         q_0 = Normal(c.new_zeros((B, 1, c.size()[2], c.size()[3])), c.new_ones((B, 1, c.size()[2], c.size()[3])))
-    #         z = q_0.sample() * temp
-    #     else:
-    #         z = debug_z
+        if debug_z is None:
+            # sample gaussian noise that matches c
+            q_0 = Normal(c.new_zeros((B, 1, c.size()[2], c.size()[3])), c.new_ones((B, 1, c.size()[2], c.size()[3])))
+            z = q_0.sample() * temp
+        else:
+            z = debug_z
 
-    #     for i, flow in enumerate(self.flows[::-1]):
-    #         i_flow = self.n_flow - (i+1)
-    #         z, c = flow.reverse_fast(z, c, i_flow)
+        # pre-compute conditioning tensors and cache them
+        c_cache =self.estimator.net.fused_filter_gate_conv_c(c)
+        c_cache = c_cache.reshape(c_cache.shape[0], self.n_layer, self.res_channel*2, c_cache.shape[2], c_cache.shape[3])
+        c_cache = c_cache.permute(1, 0, 2, 3, 4) # [num_layers, batch_size, res_channels, height, width]
+        c_cache_reversed = reverse_order(c_cache, dim=3)
 
-    #     x = unsqueeze_to_1d(z, self.n_height)
+        for i, flow in enumerate(self.flows[::-1]):
+            flow_embed = self.h_cache[i].unsqueeze(1)  # unsqueeze batch dim
+            if z.type() == 'torch.cuda.HalfTensor':
+                flow_embed = flow_embed.half()
+            c_cache_i = c_cache if i % 2 == 0 else c_cache_reversed
 
-    #     return x
+            z, _ = flow.reverse_fast(self.estimator, z, c_cache_i, i,flow_embed)
+            # c_cache_i = c_cache_i + flow_embed
+            # z, _ = flow.reverse_faster(self.estimator, z, c_cache_i)
+
+        x = unsqueeze_to_1d(z, self.n_height)
+        return x
 
     def upsample(self, c):
         c = c.unsqueeze(1)

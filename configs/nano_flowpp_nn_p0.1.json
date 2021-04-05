@@ -10,7 +10,7 @@
         "iters_per_checkpoint": 5000,
         "batch_size": 2,
         "seed": 1234,
-        "checkpoint_path": "",
+        "checkpoint_path": "./experiments/nanoflow-flow-drop0.1/waveflow_130000",
         "with_tensorboard": true
     },
     "data_config": {
@@ -30,7 +30,7 @@
     },
 
     "waveflow_config": {
-      "model_name": "nanoflow-flow-nn2",
+      "model_name": "nanoflow-flow-drop0.1",
       "cin_channels": 80,
       "res_channels": 128,
       "n_height": 16,

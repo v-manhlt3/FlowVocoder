@@ -133,9 +133,9 @@ def build_model_nano_flowpp(args_dict):
     return model
 
 
-def build_model_nano_flowpp_nn(args_dict):
+def build_model_flowvocoder(args_dict):
     # from models import waveflow
-    from models import nano_flowpp_nn as waveflow
+    from models import flowvocoder as waveflow
 
     # change dict to dot notation for code re-use
     # https://stackoverflow.com/questions/16279212/how-to-use-dot-notation-for-dict-in-python

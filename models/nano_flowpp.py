@@ -79,8 +79,8 @@ class Flow(nn.Module):
         super().__init__()
 
         self.k = 32
-        # self.layer_density_estimator = NN(in_channel, in_channel, num_blocks=5, num_components=32, drop_prob=0.0)
-        self.layer_density_estimator = ZeroConv2d(filter_size*2, (2+3*self.k)*in_channel)
+        self.layer_density_estimator = NN(in_channel, in_channel, num_blocks=5, num_components=32, drop_prob=0.0)
+        # self.layer_density_estimator = ZeroConv2d(filter_size*2, (2+3*self.k)*in_channel)
         self.multgate = nn.Parameter(torch.ones(num_layer, filter_size))
         self.n_flow = n_flow  # useful for selecting permutation
         self.bipartize = bipartize

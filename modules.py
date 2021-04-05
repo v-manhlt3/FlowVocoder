@@ -287,7 +287,7 @@ class GatedConv(nn.Module):
         super(GatedConv, self).__init__()
         self.nlin = concat_elu
         # print("gate conv")
-        self.conv = WNConv2d(2 * num_channels, num_channels, kernel_size=(1,3), padding=(0,1))
+        self.conv = WNConv2d(2 * num_channels, num_channels, kernel_size=1, padding=0)
         self.drop = nn.Dropout2d(drop_prob)
         # print("gate gate conv")
         self.gate = WNConv2d(2 * num_channels, 2*num_channels, kernel_size=1, padding=0)
@@ -354,7 +354,7 @@ class NN(nn.Module):
 
         # Split into components and post-process
         if reverse:
-            x = x.view(b, -1, c, 1, w)
+            x = x.view(b, -1, c, h, w)
         else:
             x = x.view(b, -1, c, h, w)
         s, t, pi, mu, scales = x.split((1, 1, self.k, self.k, self.k), dim=1)
