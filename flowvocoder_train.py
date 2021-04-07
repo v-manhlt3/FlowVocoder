@@ -143,7 +143,6 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
     def synthesize(sigma):
         model.eval()
         # synthesize loop
-        # model.h_cache = model.module.cache_flow_embed()
 
         for i, batch in enumerate(synth_loader):
             if i == 0:
@@ -242,8 +241,6 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
     if with_tensorboard:
         from tensorboardX import SummaryWriter
         logger = SummaryWriter(os.path.join(output_directory, waveflow_config["model_name"], 'logs'))
-
-    # scheduler = torch.optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=0.1, last_epoch)
     
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
@@ -265,8 +262,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
             if torch.isnan(loss):
                 print("!!! Loss is NaN")
                 continue
-            # if scale_loss is not None:
-            #     loss = loss*scale_loss
+
             if num_gpus > 1:
                 reduced_loss = loss.mean().item()
             else:
@@ -322,9 +318,6 @@ def synthesize_master(model, num_gpus, temp, output_directory, epochs, learning_
     iteration = 0
     if checkpoint_path != "":
         model, _, _, iteration = load_checkpoint(checkpoint_path, model, None, None)
-    # remove all weight_norm from the model
-    # model.remove_weight_norm()
-    # fuse mel-spec conditioning layer weights to maximize speed
     
 
     if fp16_run:
@@ -371,11 +364,9 @@ def synthesize_master(model, num_gpus, temp, output_directory, epochs, learning_
         audio = audio.squeeze()
         audio = audio.cpu().numpy()
         audio = audio.astype('int16')
-        # audio_path = os.path.join(
-        #     os.path.join(output_directory, "samples", waveflow_config["model_name"]),
-        #     "generate_{}_{}_t{}.wav".format(iteration, i, temp))
+
         audio_path = os.path.join(
-            os.path.join(output_directory, "samples", "MOS-5"),
+            os.path.join(output_directory, "samples", "tacotron2_synthesis"),
             filename[0].split("/")[-1])
         write(audio_path, data_config["sampling_rate"], audio)
 
@@ -396,12 +387,6 @@ def synthesize_tacotron2(model, num_gpus, temp, output_directory, epochs, learni
 
     if hasattr(model, 'cache_flow_embed'):
         model.h_cache = model.cache_flow_embed(remove_after_cache=True)  # used for flow conditioning models
-    # model.h_cache = model.module.cache_flow_embed()
-    # remove all weight_norm from the model
-    # model.remove_weight_norm()
-    # fuse mel-spec conditioning layer weights to maximize speed
-    # model.fuse_conditioning_layers()
-    # model.h_cache = model.cache_flow_embed()
 
     list_mel = glob.glob("./gen_tacotron2/*.npy")
     list_mel = [(os.path.basename(mel), np.load(mel)) for mel in list_mel]
@@ -423,15 +408,14 @@ def synthesize_tacotron2(model, num_gpus, temp, output_directory, epochs, learni
     for batch in list_mel:
         with torch.no_grad():
             filename, mel = batch[0], batch[1]
-            # print("Mel shape: ", mel.shape)
-            # mel = np.squeeze(mel, axis=1)
+
             mel = torch.autograd.Variable(torch.from_numpy(mel).float().cuda())
             mel = mel.unsqueeze(0)
             if fp16_run:
                 mel = mel.half()
             torch.cuda.synchronize()
             tic = time.time()
-            # model.h_cache = model.cache_flow_embed()
+            
             audio = model.reverse(mel, temp)
             torch.cuda.synchronize()
             toc = time.time() - tic
