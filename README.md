@@ -1,27 +1,22 @@
-## WaveFlow: A Compact Flow-based Model for Raw Audio
+## FlowVocoder: A small Footprint Neural Vocoder based Normalizing Flow forSpeech Synthesis
 
-This is an unofficial PyTorch implementation of [WaveFlow] (Ping et al, ICML 2020) model.
-
-The aim for this repo is to provide easy-to-use PyTorch version of WaveFlow as a drop-in alternative to various neural vocoder models used with NVIDIA's [Tacotron2] audio processing backend.
-
-Please refer to the [official implementation] written in PaddlePaddle for the official results.
 
 ## Setup
 
 1. Clone this repo and install requirements
 
    ```command
-   git clone https://github.com/L0SG/WaveFlow.git
-   cd WaveFlow
+   git clone https://github.com/tienmanhptit1312/FlowVocoder.git
+   cd FlowVocoder
    pip install -r requirements.txt
    ```
 
-2. Install [Apex] for mixed-precision training
+2. Install [Apex](https://github.com/NVIDIA/apex) for mixed-precision training: 
 
 
 ## Train your model
 
-1. Download [LJ Speech Data]. In this example it's in `data/`
+1. Download [LJ Speech Data](). In this example it's in `data/`
 
 2. Make a list of the file names to use for training/testing.
 
@@ -33,11 +28,11 @@ Please refer to the [official implementation] written in PaddlePaddle for the of
 
 3. Edit the configuration file and train the model.
 
-    Below are the example commands using `waveflow-h16-r64-bipartize.json`
+    Below are the example commands using `flowvocoder.json`
 
    ```command
-   nano configs/waveflow-h16-r64-bipartize.json
-   python train.py -c configs/waveflow-h16-r64-bipartize.json
+  
+   python train.py -c configs/flowvocoder.json --tr
    ```
    Single-node multi-GPU training is automatically enabled with [DataParallel] (instead of [DistributedDataParallel] for simplicity).
 
@@ -48,26 +43,21 @@ Please refer to the [official implementation] written in PaddlePaddle for the of
    `checkpoint_path` accepts either explicit path, or the parent directory if resuming from averaged weights over multiple checkpoints.
 
    ### Examples
-   insert `checkpoint_path: "experiments/waveflow-h16-r64-bipartize/waveflow_5000"` in the config file then run
+   insert `checkpoint_path: "experiments/flowvocoder/flowvocoder_5000"` in the config file then run
    ```command
-   python train.py -c configs/waveflow-h16-r64-bipartize.json
+   python train.py -c configs/flowvocoder.json --tr
    ```
 
-   for loading averaged weights over 10 recent checkpoints, insert `checkpoint_path: "experiments/waveflow-h16-r64-bipartize"` in the config file then run
+   for loading averaged weights over 10 recent checkpoints, insert `checkpoint_path: "experiments/flowvocoder"` in the config file then run
    ```command
-   python train.py -a 10 -c configs/waveflow-h16-r64-bipartize.json
-   ```
-
-   you can reset the optimizer and training scheduler (and keep the weights) by providing `--warm_start`
-   ```command
-   python train.py --warm_start -c configs/waveflow-h16-r64-bipartize.json
+   python train.py -a 10 -c configs/flowvocoder.json
    ```
    
 4. Synthesize waveform from the trained model.
 
    insert `checkpoint_path` in the config file and use `--synthesize` to `train.py`. The model generates waveform by looping over `test_files.txt`.
    ```command
-   python train.py --synthesize -c configs/waveflow-h16-r64-bipartize.json
+   python train.py --synthesize -c configs/flowvocoder.json
    ```
    if `fp16_run: true`, the model uses FP16 (half-precision) arithmetic for faster performance (on GPUs equipped with Tensor Cores).
    
