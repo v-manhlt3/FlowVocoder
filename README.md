@@ -16,22 +16,26 @@
 
 ## Train your model
 
-1. Download [LJ Speech Data](). In this example it's in `data/`
+1. Download [LJ Speech Data](https://keithito.com/LJ-Speech-Dataset/). Then, uncompress LJ-Speech dataset where you downloaded it.
+2. Copy wave files from LJ-Speech directory to FlowVocoder directory.
 
-2. Make a list of the file names to use for training/testing.
+   ```
+   cp -r [LJ-Speech dataset's directory]/wavs [FlowVocoder's directory]
+   ```
+
+3. Make a list of the file names to use for training/testing.
 
    ```command
-   ls data/*.wav | tail -n+10 > train_files.txt
-   ls data/*.wav | head -n10 > test_files.txt
+   ls wavs/*.wav | tail -n+1310 > train_files.txt
+   ls wavs/*.wav | head -n1310 > test_files.txt
    ```
-    `-n+10` and `-n10` indicates that this example reserves the first 10 audio clips for model testing.
+   `-n1310` indicates that this example reserves the first 1310 audio clips for model testing. The remaining dataset is used for training.
 
-3. Edit the configuration file and train the model.
+4. Edit the configuration file and train the model.
 
     Below are the example commands using `flowvocoder.json`
 
    ```command
-  
    python train.py -c configs/flowvocoder.json --tr
    ```
    Single-node multi-GPU training is automatically enabled with [DataParallel] (instead of [DistributedDataParallel] for simplicity).
@@ -41,7 +45,8 @@
    You can load the trained weights from saved checkpoints by providing the path to `checkpoint_path` variable in the config file.
 
    `checkpoint_path` accepts either explicit path, or the parent directory if resuming from averaged weights over multiple checkpoints.
-
+   It takes about a week to train this model with two V100 Nvidia GPUs with batch-size=2. You can download our pretrained model for about 1M training iterations: [link](https://drive.google.com/file/d/1K-NAXjh9DvBEiAXQHay5jC-oivMgX7RQ/view?usp=sharing) for reproducing purpose.
+   
    ### Examples
    insert `checkpoint_path: "experiments/flowvocoder/flowvocoder_5000"` in the config file then run
    ```command
@@ -53,9 +58,9 @@
    python train.py -a 10 -c configs/flowvocoder.json
    ```
    
-4. Synthesize waveform from the trained model.
+5. Synthesize waveform from the trained model.
 
-   insert `checkpoint_path` in the config file and use `--synthesize` to `train.py`. The model generates waveform by looping over `test_files.txt`.
+   insert `checkpoint_path` in the config file and use `--synthesize` to `train.py`. The model generates waveform by looping over `test_files.txt`.  
    ```command
    python train.py --synthesize -c configs/flowvocoder.json
    ```
@@ -63,20 +68,7 @@
    
    
 ## Reference
-NVIDIA Tacotron2: https://github.com/NVIDIA/waveglow
+NVIDIA Tacotron2: https://github.com/NVIDIA/tacotron2
 
-NVIDIA WaveGlow: https://github.com/NVIDIA/waveglow
+WaveFlow: https://github.com/L0SG/WaveFlow
 
-r9y9 wavenet-vocoder: https://github.com/r9y9/wavenet_vocoder
-
-FloWaveNet: https://github.com/ksw0306/FloWaveNet
-
-Parakeet: https://github.com/PaddlePaddle/Parakeet
-
-[Tacotron2]: https://github.com/NVIDIA/tacotron2
-[DataParallel]: https://pytorch.org/docs/stable/generated/torch.nn.DataParallel.html
-[DistributedDataParallel]: https://pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html
-[WaveFlow]: https://arxiv.org/abs/1912.01219
-[LJ Speech Data]: https://keithito.com/LJ-Speech-Dataset
-[Apex]: https://github.com/nvidia/apex
-[official implementation]: https://github.com/PaddlePaddle/Parakeet
