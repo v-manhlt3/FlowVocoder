@@ -294,7 +294,7 @@ def train(model, num_gpus, output_directory, epochs, learning_rate, lr_decay_ste
                 logger.flush()
 
             if (iteration % iters_per_checkpoint == 0):
-                checkpoint_path = "{}/waveflow_{}".format(
+                checkpoint_path = "{}/flowvocoder_{}".format(
                     os.path.join(output_directory, waveflow_config["model_name"]), iteration)
                 save_checkpoint(model, optimizer, scheduler, learning_rate, iteration,
                                 checkpoint_path)
