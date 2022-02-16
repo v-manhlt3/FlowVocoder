@@ -322,8 +322,13 @@ def synthesize_master(model, num_gpus, temp, output_directory, epochs, learning_
     iteration = 0
     if checkpoint_path != "":
         model, _, _, iteration = load_checkpoint(checkpoint_path, model, None, None)
+
+    if hasattr(model, 'cache_flow_embed'):
+        model.h_cache = model.cache_flow_embed(remove_after_cache=True)
     # remove all weight_norm from the model
-    # model.remove_weight_norm()
+    model.remove_weight_norm()
+    model.fuse_conditioning_layers()
+
     # fuse mel-spec conditioning layer weights to maximize speed
     
 
@@ -361,9 +366,10 @@ def synthesize_master(model, num_gpus, temp, output_directory, epochs, learning_
 
             torch.cuda.synchronize()
             tic = time.time()
-            audio = model.reverse(mel, temp)
+            audio = model.reverse_fast(mel, temp)
             torch.cuda.synchronize()
             toc = time.time() - tic
+            print("EST time: ", toc)
 
             print('{}: {:.4f} seconds, {:.4f}kHz'.format(i, toc, audio.shape[1] / toc / 1000))
 

@@ -1,7 +1,8 @@
 from torch import nn
 import sys
-from modules import Conv2D, NN, Wavenet2DHyperMultGate, WNConv2d
-
+sys.path.append('/root/TTS-dir/WaveFlow/')
+from modules import Wavenet2D, Conv2D, ZeroConv2d, ZeroConv2d_1, NN, Wavenet2DHyperMultGate, WNConv2d
+import time
 
 from utils import log_dist as logistic
 from torch.nn.utils import weight_norm
@@ -53,21 +54,28 @@ class WaveNet2DHyperDensityEstimator(nn.Module):
                              hyper_channels=hyper_channels,
                              kernel_size=3, cin_channels=cin_channel, dilation_h=self.dilation_h,
                              dilation_w=self.dilation_w)
+        # self.proj = WNConv2d(filter_size, in_channel, kernel_size=1, padding=0)
 
 
     def forward(self, x, c=None, context=None, multgate=None, debug=False):
         out = self.net(x, c, context, multgate)
+        # out = self.proj(out)
         return out
 
     def reverse(self, x, c=None, context=None, multgate=None, debug=False):
         out = self.net.reverse(x, c, context, multgate)
+        # out = self.proj(out)
         return out
 
     def reverse_fast(self, x, c=None, context=None, multgate=None, debug=False):
         out = self.net.reverse_fast(x, c, context, multgate)
+        # out = self.proj(out)
         return out
 
-
+    # def reverse_faster(self, x, c=None, multgate=None, debug=False):
+    #     out = self.net.reverse_faster(x, c, multgate)
+    #     out = self.proj(out)
+    #     return out
 
 
 class Flow(nn.Module):
@@ -96,7 +104,6 @@ class Flow(nn.Module):
         b, ch, h, w = x_shift.size()
 
         feat = estimator(x_shift, c, embedding, self.multgate)
-
         a, b, pi, mu, scales = self.layer_density_estimator(feat)
 
         x_out = x
@@ -106,7 +113,6 @@ class Flow(nn.Module):
 
         logistic_ldj = logistic.mixture_log_pdf(x, pi, mu, scales)
         logdet = torch.flatten(logistic_ldj + a + scale_ldj).sum(-1)
-
 
         if debug:
             return out, c, logdet, log_s, t
@@ -118,13 +124,13 @@ class Flow(nn.Module):
 
         for i_h in range(0, self.num_height):
             b, ch,h, w = x.size()
+            # print("flow: {}, x shape: {}------ c shape: {}".format(i_h, x.shape, c[:, :, :, :i_h+1, :].shape))
             feat = estimator.reverse(x, c[:, :, :, :i_h+1, :], embedding[:, :, :, :i_h + 1, :]
                     , self.multgate)[:, :, -1, :].unsqueeze(2)
 
-            """ compute inver data-parameterized family """
-            a, b, pi, mu, scales = self.layer_density_estimator(feat)
-
-            # a, b, pi, mu, scales = self.layer_density_estimator(feat, reverse=True)
+            """ compute inver data-parameterized family"""
+            a, b, pi, mu, scales = self.layer_density_estimator(feat, reverse=True)
+            end = time.time()
 
             x_new = (z[:, :, i_h, :].unsqueeze(2) - b)*torch.exp(-a)
             x_new, scale_ldj = self.scale_flow.inverse(x_new)
@@ -133,23 +139,24 @@ class Flow(nn.Module):
             x = torch.cat((x, x_new), 2)
 
         x = x[:,:,1:,:]
-
         x = reverse_order(x)
         c = reverse_order(c, dim=3)
 
         return x, c
 
-    def reverse_fast(self, estimator,z, c, i, embedding):
+    def reverse_fast(self,estimator, z, c, embedding):
         x = torch.zeros_like(z[:, :, 0:1, :])
         estimator.net.conv_queue_init(x)
 
         for i_h in range(0, self.num_height):
             b, ch,h, w = x.size()
-            feat = estimator.reverse(x, c[:, :, :, :i_h+1, :], embedding[:, :, :, :i_h + 1, :]
+            # print("flow: {}, x shape: {}------ c shape: {}".format(i_h, x.shape, c[:, :, :, :i_h+1, :].shape))
+            feat = estimator.reverse_fast(x if i_h == 0 else x_new, c[:, :, :, i_h:i_h+1, :], embedding[:, :, :, :, :]
                     , self.multgate)[:, :, -1, :].unsqueeze(2)
 
-            """ compute inver data-parameterized family """
-            a, b, pi, mu, scales = self.layer_density_estimator(feat)
+            """ compute inver data-parameterized family"""
+            a, b, pi, mu, scales = self.layer_density_estimator(feat, reverse=True)
+            end = time.time()
 
             x_new = (z[:, :, i_h, :].unsqueeze(2) - b)*torch.exp(-a)
             x_new, scale_ldj = self.scale_flow.inverse(x_new)
@@ -158,7 +165,6 @@ class Flow(nn.Module):
             x = torch.cat((x, x_new), 2)
 
         x = x[:,:,1:,:]
-
         x = reverse_order(x)
         c = reverse_order(c, dim=3)
 
@@ -186,6 +192,10 @@ class WaveFlow(nn.Module):
         self.size_flow_embed = size_flow_embed
         self.flow_embedding = nn.Embedding(self.n_flow, self.size_flow_embed)
 
+        # self.use_weightnorm_embed = use_weightnorm_embed
+        # if self.use_weightnorm_embed:
+        #     print("INFO: using weightnorm at embedding layer")
+        #     self.flow_embedding = nn.utils.weight_norm(self.flow_embedding)
         nn.init.orthogonal_(self.flow_embedding.weight)
         #########################################################################################
 
@@ -259,6 +269,7 @@ class WaveFlow(nn.Module):
             flow_embed = self.flow_embedding(flow_token[:, i])
             flow_embed = flow_embed.unsqueeze(-1).unsqueeze(-1) # match shape
             out, c, logdet_new, log_s, t = flow(self.estimator, out, c, i_flow,flow_embed, debug)
+            # print("logdet_new: ", logdet_new.shape)
             list_logdet.append(logdet_new.sum().divide(B*h*T))
             if debug:
                 list_log_s.append(log_s)
@@ -273,6 +284,8 @@ class WaveFlow(nn.Module):
 
     def reverse(self, c, temp=1.0, debug_z=None):
         # plain implementation of reverse ops
+        # print("Size of c: ", c.shape)
+
         c = self.upsample(c)
         # trim conv artifacts. maybe pad spec to kernel multiple
         time_cutoff = self.upsample_conv_kernel_size - self.upsample_conv_stride
@@ -288,6 +301,7 @@ class WaveFlow(nn.Module):
             z = q_0.sample() * temp
         else:
             z = debug_z
+        # print("number of flow model: ", 8)
         c_cache = []
         for i, resblock in enumerate(self.estimator.net.res_blocks):
             filter_gate_conv_c = resblock.filter_gate_conv_c(c)
@@ -297,6 +311,7 @@ class WaveFlow(nn.Module):
         for i, flow in enumerate(self.flows[::-1]):
             flow_embed = self.h_cache[i].unsqueeze(1)
             i_flow = self.n_flow - (i+1)
+            # print("reverse step: ", i)
             z, c = flow.reverse(self.estimator, z, c_cache, i_flow, flow_embed)
 
         x = unsqueeze_to_1d(z, self.n_height)
@@ -332,7 +347,7 @@ class WaveFlow(nn.Module):
                 flow_embed = flow_embed.half()
             c_cache_i = c_cache if i % 2 == 0 else c_cache_reversed
 
-            z, _ = flow.reverse_fast(self.estimator, z, c_cache_i, i,flow_embed)
+            z, _ = flow.reverse_fast(self.estimator, z, c_cache_i, flow_embed)
             # c_cache_i = c_cache_i + flow_embed
             # z, _ = flow.reverse_faster(self.estimator, z, c_cache_i)
 
@@ -353,16 +368,31 @@ class WaveFlow(nn.Module):
                 torch.nn.utils.remove_weight_norm(layer)
             except ValueError:
                 pass
-        for flow in self.flows.children():
-            net = self.estimator.net
+
+        net = self.estimator.net
+        try:
             torch.nn.utils.remove_weight_norm(net.front_conv[0].conv)
-            for resblock in net.res_blocks.children():
+        except ValueError:
+            for i in range(len(net.front_conv[0].conv)):
+                torch.nn.utils.remove_weight_norm(net.front_conv[0].conv[i])
+        for resblock in net.res_blocks.children():
+            try:
                 torch.nn.utils.remove_weight_norm(resblock.filter_gate_conv.conv)
-                torch.nn.utils.remove_weight_norm(resblock.filter_gate_conv_c)
-                torch.nn.utils.remove_weight_norm(resblock.res_skip_conv)
+            except ValueError:
+                for i in range(len(resblock.filter_gate_conv.conv)):
+                    torch.nn.utils.remove_weight_norm(resblock.filter_gate_conv.conv[i])
+            torch.nn.utils.remove_weight_norm(resblock.filter_gate_conv_c)
+            if hasattr(resblock, "filter_gate_conv_h"):
+                torch.nn.utils.remove_weight_norm(resblock.filter_gate_conv_h)
+            torch.nn.utils.remove_weight_norm(resblock.res_skip_conv)
+        try:
+            torch.nn.utils.remove_weight_norm(self.flow_embedding)
+        except ValueError:
+            pass
 
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print("weight_norm removed: {} params".format(total_params))
+
 
     def fuse_conditioning_layers(self):
         # fuse mel-spec conditioning layers into one big conv weight
@@ -399,3 +429,5 @@ if __name__ == "__main__":
         out = net.reverse(c)
         net.fuse_conditioning_layers()
         # out_fast = net.reverse_fast(c)
+
+
